@@ -684,8 +684,8 @@ def _generate_create_table_ddl(
         dim = schema.columns.get(idx.field_name)
         dim_val = dim.vector_dimension if dim else None
         props = [
-            f'"index_type" = "{idx.index_type}"',
-            f'"metric_type" = "{idx.metric_type}"',
+            f'"index_type" = "{idx.index_type.lower()}"',
+            f'"metric_type" = "{idx.metric_type.lower()}"',
         ]
         if dim_val:
             props.append(f'"dim" = "{dim_val}"')
