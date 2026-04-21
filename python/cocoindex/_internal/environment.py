@@ -4,8 +4,9 @@ Environment module.
 
 from __future__ import annotations
 
-from inspect import isasyncgenfunction
 import asyncio
+import atexit
+from inspect import isasyncgenfunction
 import threading
 import warnings
 import weakref
@@ -29,7 +30,8 @@ from ..engine_object import dump_engine_object
 from .context_keys import ContextKey, ContextProvider
 
 if TYPE_CHECKING:
-    from cocoindex._internal.app import AppBase
+    from cocoindex._internal.app import App
+    from .component_ctx import ExceptionHandler
 
 T = TypeVar("T")
 
@@ -87,10 +89,12 @@ class EnvironmentBuilder:
 
     _settings: setting.Settings
     _context_provider: ContextProvider
+    _exception_handler: ExceptionHandler | None
 
     def __init__(self, settings: setting.Settings | None = None):
         self._settings = settings or setting.Settings.from_env()
         self._context_provider = ContextProvider()
+        self._exception_handler = None
 
     @property
     def settings(self) -> setting.Settings:
@@ -106,6 +110,9 @@ class EnvironmentBuilder:
         self, key: ContextKey[Any], cm: AsyncContextManager[Any]
     ) -> Any:
         return await self._context_provider.provide_async_with(key, cm)
+
+    def set_exception_handler(self, handler: ExceptionHandler) -> None:
+        self._exception_handler = handler
 
 
 LifespanFn = (
@@ -130,7 +137,7 @@ class EnvironmentInfo:
     __slots__ = ("_env_ref", "_app_registry", "_app_registry_lock")
 
     _env_ref: weakref.ReferenceType[Environment | LazyEnvironment]
-    _app_registry: weakref.WeakValueDictionary[str, AppBase[Any, Any]]
+    _app_registry: weakref.WeakValueDictionary[str, App[Any, Any]]
     _app_registry_lock: threading.Lock
 
     def __init__(self, env: Environment | LazyEnvironment) -> None:
@@ -140,7 +147,7 @@ class EnvironmentInfo:
         with _environment_info_lock:
             _environment_infos.append(self)
 
-    def register_app(self, name: str, app: AppBase[Any, Any]) -> None:
+    def register_app(self, name: str, app: App[Any, Any]) -> None:
         """Register an app with this environment."""
         with self._app_registry_lock:
             if name in self._app_registry:
@@ -149,7 +156,7 @@ class EnvironmentInfo:
                 )
             self._app_registry[name] = app
 
-    def get_apps(self) -> list[AppBase[Any, Any]]:
+    def get_apps(self) -> list[App[Any, Any]]:
         """Get all registered apps for this environment."""
         with self._app_registry_lock:
             return list(self._app_registry.values())
@@ -188,6 +195,7 @@ class Environment:
         "_context_provider",
         "_loop_runner",
         "_async_context",
+        "_exception_handler",
         "_info",
         "__weakref__",
     )
@@ -198,6 +206,7 @@ class Environment:
     _context_provider: ContextProvider
     _loop_runner: _LoopRunner
     _async_context: core.AsyncContext
+    _exception_handler: ExceptionHandler | None
     _info: EnvironmentInfo
 
     def __init__(
@@ -207,6 +216,7 @@ class Environment:
         name: str | None = None,
         context_provider: ContextProvider | None = None,
         event_loop: asyncio.AbstractEventLoop | None = None,
+        exception_handler: ExceptionHandler | None = None,
         info: EnvironmentInfo | None = None,
     ):
         if not settings.db_path:
@@ -230,6 +240,8 @@ class Environment:
         self._core_env = core.Environment(
             dump_engine_object(settings), self._async_context
         )
+        self._context_provider.set_core_env(self._core_env)
+        self._exception_handler = exception_handler
         self._info = info or EnvironmentInfo(self)
 
     @property
@@ -253,13 +265,17 @@ class Environment:
         """Get the AsyncContext for this environment's event loop."""
         return self._async_context
 
+    @property
+    def exception_handler(self) -> ExceptionHandler | None:
+        return self._exception_handler
+
     def get_context(self, key: ContextKey[T]) -> T:
         """Get a context value provided during this environment's lifespan.
 
         Use this to access context values outside of CocoIndex processing components,
         e.g., to share a database connection pool between indexing and query/serving logic.
         """
-        return self._context_provider.use(key)
+        return self._context_provider.get(key)
 
     async def _get_env(self) -> "Environment":
         return self
@@ -390,6 +406,7 @@ class LazyEnvironment:
                     name=self._name,
                     context_provider=context_provider,
                     event_loop=loop,
+                    exception_handler=env_builder._exception_handler,
                     info=self._info,
                 )
                 self._env = env
@@ -481,6 +498,63 @@ def default_env_loop() -> asyncio.AbstractEventLoop:
 
         _bg_loop_runner = _LoopRunner.create_new_running()
         return _bg_loop_runner.loop
+
+
+def _shutdown_background_loop_at_exit() -> None:
+    """
+    Atexit hook: stop and close the default env background loop if it was started.
+
+    Prevents the background loop thread from outliving the interpreter, which can
+    cause SIGSEGV or GIL errors during finalization (e.g. on Ubuntu CI). Safe to
+    call even if the loop was never started (no-op).
+    """
+    global _bg_loop_runner  # pylint: disable=global-statement
+
+    with _bg_loop_lock:
+        runner = _bg_loop_runner
+        _bg_loop_runner = None
+
+    if runner is None:
+        return
+
+    loop = runner.loop
+    if loop.is_closed():
+        return
+
+    try:
+        thread = runner.thread
+        if thread is not None and thread.is_alive():
+            loop.call_soon_threadsafe(loop.stop)
+            thread.join(timeout=1.0)
+        if not loop.is_closed():
+            loop.close()
+        if thread is not None and thread.is_alive():
+            thread.join(timeout=1.0)
+    except Exception:
+        pass
+
+
+def _shutdown_at_exit() -> None:
+    """
+    Atexit hook: shut down the Tokio runtime first, then stop the background
+    asyncio loop.
+
+    Order matters: the Tokio runtime is shut down before the asyncio loop so
+    that no asyncio callbacks can race with runtime shutdown. With
+    ManuallyDrop<Runtime>, Tokio threads stay alive indefinitely after the main
+    work completes. On Python < 3.13, `_PyGILState_Fini` (called during
+    `Py_Finalize()`) deletes `autoTSSkey`; if any idle Tokio thread then calls
+    `PyGILState_Release`, it reads a deleted TLS key and triggers the fatal
+    error: "PyGILState_Release: thread state X must be current when releasing".
+    """
+    try:
+        core.shutdown_tokio_runtime()
+    except Exception:
+        pass
+    _shutdown_background_loop_at_exit()
+
+
+atexit.register(_shutdown_at_exit)
 
 
 def start_sync() -> Environment:

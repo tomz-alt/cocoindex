@@ -2,7 +2,9 @@ use std::sync::OnceLock;
 
 use crate::prelude::*;
 
-use cocoindex_core::engine::runtime::get_runtime;
+use cocoindex_core::engine::runtime::{
+    cancel_all, get_runtime, reset_global_cancellation, shutdown_runtime,
+};
 use cocoindex_py_utils::from_py_future;
 use futures::FutureExt;
 use pyo3::{call::PyCallArgs, exceptions::PyException};
@@ -11,7 +13,7 @@ use tokio_util::task::AbortOnDropHandle;
 
 pub struct PythonObjects {
     pub serialize_fn: Py<PyAny>,
-    pub deserialize_fn: Py<PyAny>,
+    pub handler_wrapper_fn: Py<PyAny>,
     pub non_existence: Py<PyAny>,
     pub not_set: Py<PyAny>,
 }
@@ -30,20 +32,14 @@ impl PythonObjects {
         })()
         .from_py_result()
     }
-
-    pub fn deserialize<'py>(&self, py: Python<'py>, value: &[u8]) -> Result<Py<PyAny>> {
-        self.deserialize_fn
-            .call(py, (value,), None)
-            .from_py_result()
-    }
 }
 
-static PY_OBJECTS: OnceLock<PythonObjects> = OnceLock::new();
+static PY_OBJECTS: OnceLock<std::mem::ManuallyDrop<PythonObjects>> = OnceLock::new();
 
 #[pyfunction]
 pub fn init_runtime(
     serialize_fn: Py<PyAny>,
-    deserialize_fn: Py<PyAny>,
+    handler_wrapper_fn: Py<PyAny>,
     non_existence: Py<PyAny>,
     not_set: Py<PyAny>,
 ) -> PyResult<()> {
@@ -53,18 +49,47 @@ pub fn init_runtime(
         ));
     }
     PY_OBJECTS
-        .set(PythonObjects {
+        .set(std::mem::ManuallyDrop::new(PythonObjects {
             serialize_fn,
-            deserialize_fn,
+            handler_wrapper_fn,
             non_existence,
             not_set,
-        })
+        }))
         .map_err(|_| PyException::new_err("Failed to set Python objects: already initialized"))?;
     Ok(())
 }
 
+#[pyfunction]
+pub fn shutdown_tokio_runtime() {
+    shutdown_runtime();
+}
+
+/// Cancel the global cancellation token, causing all in-flight operations to
+/// exit promptly.  Safe to call from signal handlers.
+#[pyfunction]
+#[pyo3(name = "cancel_all")]
+pub fn py_cancel_all() {
+    cancel_all();
+}
+
+/// Replace the cancelled global token with a fresh one so new operations can
+/// proceed.  Called automatically at the start of each CLI command.
+#[pyfunction]
+#[pyo3(name = "reset_global_cancellation")]
+pub fn py_reset_global_cancellation() {
+    reset_global_cancellation();
+}
+
 pub fn python_objects() -> &'static PythonObjects {
-    PY_OBJECTS.get().expect("Python objects not initialized")
+    // ManuallyDrop<T> implements Deref<Target = T>, so &**x coerces to &T.
+    &**PY_OBJECTS.get().expect("Python objects not initialized")
+}
+
+/// Wrap a Python target handler with _TypedTargetHandlerWrapper for typed deserialization.
+pub fn wrap_target_handler(py: Python<'_>, handler: &Py<PyAny>) -> PyResult<Py<PyAny>> {
+    python_objects()
+        .handler_wrapper_fn
+        .call(py, (handler,), None)
 }
 
 #[pyclass(name = "AsyncContext")]

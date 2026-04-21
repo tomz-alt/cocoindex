@@ -1,6 +1,9 @@
 use crate::{
     prelude::*,
-    state::stable_path::{StablePathPrefix, StablePathRef},
+    state::{
+        stable_path::{StablePathPrefix, StablePathRef},
+        target_state_path::{TargetStatePathWithProviderId, TargetStateProviderGeneration},
+    },
 };
 
 use std::{borrow::Cow, collections::BTreeMap, io::Write};
@@ -26,7 +29,7 @@ pub enum StablePathEntryKey {
     FunctionMemoization(Fingerprint),
 
     /// Required.
-    /// Value type: StablePathEntryEffectInfo
+    /// Value type: StablePathEntryTargetStateInfo
     TrackingInfo,
 
     ChildExistencePrefix,
@@ -177,6 +180,14 @@ pub struct ComponentMemoizationInfo<'a> {
     pub return_value: MemoizedValue<'a>,
     #[serde(rename = "L", default, skip_serializing_if = "Vec::is_empty")]
     pub logic_deps: Vec<Fingerprint>,
+    #[serde(rename = "S", default, skip_serializing_if = "Vec::is_empty", borrow)]
+    pub memo_states: Vec<MemoizedValue<'a>>,
+    /// Context-borne memo states, keyed by the tracked-context value's fingerprint.
+    /// Stored as `Vec<(Fingerprint, _)>` rather than `HashMap` because no one looks up
+    /// by fingerprint inside this container — both Rust and Python iterate it linearly
+    /// at validation time.
+    #[serde(rename = "CS", default, skip_serializing_if = "Vec::is_empty", borrow)]
+    pub context_memo_states: Vec<(Fingerprint, Vec<MemoizedValue<'a>>)>,
 }
 
 #[derive(Serialize, Deserialize, Debug)]
@@ -197,11 +208,17 @@ pub struct FunctionMemoizationEntry<'a> {
     /// Only needs to keep dependencies with side effects other than return value (child components / target states / dependency entries with side effects).
     #[serde(rename = "D", default, skip_serializing_if = "Vec::is_empty")]
     pub dependency_memo_entries: Vec<Fingerprint>,
+    #[serde(rename = "S", default, skip_serializing_if = "Vec::is_empty", borrow)]
+    pub memo_states: Vec<MemoizedValue<'a>>,
+    /// Context-borne memo states, keyed by the tracked-context value's fingerprint.
+    /// See `ComponentMemoizationInfo::context_memo_states`.
+    #[serde(rename = "CS", default, skip_serializing_if = "Vec::is_empty", borrow)]
+    pub context_memo_states: Vec<(Fingerprint, Vec<MemoizedValue<'a>>)>,
 }
 
 #[serde_as]
 #[derive(Serialize, Deserialize, Debug)]
-pub enum EffectInfoItemState<'a> {
+pub enum TargetStateInfoItemState<'a> {
     #[serde(rename = "D")]
     Deleted,
     #[serde(untagged)]
@@ -212,27 +229,49 @@ pub enum EffectInfoItemState<'a> {
     ),
 }
 
-impl<'a> EffectInfoItemState<'a> {
+impl<'a> TargetStateInfoItemState<'a> {
     pub fn is_deleted(&self) -> bool {
-        matches!(self, EffectInfoItemState::Deleted)
+        matches!(self, TargetStateInfoItemState::Deleted)
     }
 
     pub fn as_ref(&self) -> Option<&[u8]> {
         match self {
-            EffectInfoItemState::Deleted => None,
-            EffectInfoItemState::Existing(s) => Some(s.as_ref()),
+            TargetStateInfoItemState::Deleted => None,
+            TargetStateInfoItemState::Existing(s) => Some(s.as_ref()),
         }
     }
 }
 
+fn u64_is_zero(v: &u64) -> bool {
+    *v == 0
+}
+
 #[serde_as]
 #[derive(Serialize, Deserialize, Debug)]
-pub struct EffectInfoItem<'a> {
+pub struct TargetStateInfoItem<'a> {
     #[serde_as(as = "Bytes")]
     #[serde(rename = "P", borrow)]
     pub key: Cow<'a, [u8]>,
     #[serde(rename = "S", borrow, default, skip_serializing_if = "Vec::is_empty")]
-    pub states: Vec<(/*version*/ u64, EffectInfoItemState<'a>)>,
+    pub states: Vec<(/*version*/ u64, TargetStateInfoItemState<'a>)>,
+
+    /// Schema version for the current target state's provider.
+    /// It's updated only after commit done. So it reflects the earliest schema version in `states`, if multiple.
+    #[serde(rename = "V", default, skip_serializing_if = "u64_is_zero")]
+    pub provider_schema_version: u64,
+
+    /// Available when the current item is for a target state creating a provider for child states (e.g. a table).
+    /// It decides the generation of the provider.
+    #[serde(rename = "G", default, skip_serializing_if = "Option::is_none")]
+    pub provider_generation: Option<TargetStateProviderGeneration>,
+}
+
+/// Inverted tracking: maps a `TargetStatePath` to the component that owns it.
+/// Stored under `DbEntryKey::TargetState(target_state_path)`.
+#[derive(Serialize, Deserialize, Debug)]
+pub struct TargetStateOwnerInfo {
+    #[serde(rename = "C")]
+    pub component_path: StablePath,
 }
 
 pub const UNKNOWN_PROCESSOR_NAME: &'static str = "<unknown>";
@@ -246,7 +285,7 @@ pub struct StablePathEntryTrackingInfo<'a> {
     #[serde(rename = "V")]
     pub version: u64,
     #[serde(rename = "I", borrow)]
-    pub effect_items: BTreeMap<TargetStatePath, EffectInfoItem<'a>>,
+    pub target_state_items: BTreeMap<TargetStatePathWithProviderId, TargetStateInfoItem<'a>>,
     #[serde(rename = "N", borrow, default = "unknown_processor_name")]
     pub processor_name: Cow<'a, str>,
 }
@@ -255,7 +294,7 @@ impl<'a> StablePathEntryTrackingInfo<'a> {
     pub fn new(processor_name: Cow<'a, str>) -> Self {
         Self {
             version: 0,
-            effect_items: BTreeMap::new(),
+            target_state_items: BTreeMap::new(),
             processor_name,
         }
     }

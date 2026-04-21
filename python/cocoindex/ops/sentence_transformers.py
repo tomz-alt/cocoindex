@@ -16,7 +16,6 @@ import numpy as _np
 from numpy.typing import NDArray as _NDArray
 
 import cocoindex as coco
-import cocoindex.asyncio as coco_aio
 from cocoindex.resources import schema as _schema
 
 if _typing.TYPE_CHECKING:
@@ -32,8 +31,10 @@ class SentenceTransformerEmbedder(_schema.VectorSchemaProvider):
     Args:
         model_name_or_path: Name of a pre-trained model from HuggingFace or path
             to a local model directory.
-        normalize_embeddings: Whether to normalize embeddings to unit length.
-            Defaults to True for compatibility with cosine similarity.
+        device: Device to load the model on (e.g., ``"cuda"``, ``"cpu"``).
+            Defaults to ``None`` to let SentenceTransformer auto-detect.
+        trust_remote_code: Whether to allow loading models with custom code
+            from the HuggingFace Hub (e.g., Jina models with custom pooling).
 
     Example:
         >>> from cocoindex.ops.sentence_transformers import SentenceTransformerEmbedder
@@ -43,8 +44,8 @@ class SentenceTransformerEmbedder(_schema.VectorSchemaProvider):
         >>> schema = await embedder.__coco_vector_schema__()
         >>> print(f"Embedding dimension: {schema.size}, dtype: {schema.dtype}")
         >>>
-        >>> # Embed text to embedding
-        >>> embedding = embedder.embed("Hello, world!")
+        >>> # Embed text
+        >>> embedding = await embedder.embed("Hello, world!")
         >>> print(f"Shape: {embedding.shape}, dtype: {embedding.dtype}")
     """
 
@@ -52,23 +53,27 @@ class SentenceTransformerEmbedder(_schema.VectorSchemaProvider):
         self,
         model_name_or_path: str,
         *,
-        normalize_embeddings: bool = True,
+        device: str | None = None,
+        trust_remote_code: bool = False,
     ) -> None:
         """Initialize the SentenceTransformer embedder."""
         self._model_name_or_path = model_name_or_path
-        self._normalize_embeddings = normalize_embeddings
+        self._device = device
+        self._trust_remote_code = trust_remote_code
         self._model: SentenceTransformer | None = None
         self._lock = _threading.Lock()
 
     def __getstate__(self) -> dict[str, _Any]:
         return {
             "model_name_or_path": self._model_name_or_path,
-            "normalize_embeddings": self._normalize_embeddings,
+            "device": self._device,
+            "trust_remote_code": self._trust_remote_code,
         }
 
     def __setstate__(self, state: dict[str, _Any]) -> None:
         self._model_name_or_path = state["model_name_or_path"]
-        self._normalize_embeddings = state["normalize_embeddings"]
+        self._device = state["device"]
+        self._trust_remote_code = state["trust_remote_code"]
         self._model = None
         self._lock = _threading.Lock()
 
@@ -76,42 +81,92 @@ class SentenceTransformerEmbedder(_schema.VectorSchemaProvider):
         """Lazy-load the model (thread-safe)."""
         if self._model is None:
             with self._lock:
-                # Double-check pattern
                 if self._model is None:
                     from sentence_transformers import SentenceTransformer
 
-                    self._model = SentenceTransformer(self._model_name_or_path)
+                    self._model = SentenceTransformer(
+                        self._model_name_or_path,
+                        device=self._device,
+                        trust_remote_code=self._trust_remote_code,
+                    )
         return self._model
 
-    @coco_aio.function(
-        batching=True, runner=coco.GPU, memo=True, max_batch_size=64, version=1
-    )
-    def embed(self, texts: list[str]) -> list[_NDArray[_np.float32]]:
-        """Embed texts to embedding vectors.
-
-        With batching enabled, this function receives a batch of texts and returns
-        a batch of embeddings. The external signature is still single text -> single embedding.
+    @coco.fn.as_async(batching=True, runner=coco.GPU, max_batch_size=64)
+    def _embed(
+        self,
+        texts: list[str],
+        prompt_name: str | None = None,
+        normalize_embeddings: bool = True,
+    ) -> list[_NDArray[_np.float32]]:
+        """Batched embedding. Concurrent single-text calls into :meth:`embed`
+        are grouped by the ``@coco.fn.as_async(batching=True)`` decorator;
+        this method is the per-batch body invoked by the decorator.
 
         Args:
-            texts: List of text strings to embed (batched input).
+            texts: Batch of text strings to embed (handled by the engine).
+            prompt_name: Prompt name for instruction following models that use
+                different prompts for queries vs documents.
+            normalize_embeddings: Whether to normalize embeddings to unit length.
+                Defaults to ``True`` for compatibility with cosine similarity.
 
-        Returns:
-            List of numpy arrays, each of shape (dim,) containing an embedding vector.
+        Note:
+            Pass ``prompt_name`` and ``normalize_embeddings`` consistently across
+            calls — mixing explicit values with defaults creates separate batchers.
         """
         model = self._get_model()
         embeddings: _NDArray[_np.float32] = model.encode(
             texts,
+            prompt_name=prompt_name,
             convert_to_numpy=True,
-            normalize_embeddings=self._normalize_embeddings,
+            normalize_embeddings=normalize_embeddings,
+            show_progress_bar=False,
         )  # type: ignore[assignment]
         return list(embeddings)
 
-    @coco_aio.function(runner=coco.GPU, memo=True)
-    def __coco_vector_schema__(self) -> _schema.VectorSchema:
+    @coco.fn(memo=True, version=1, logic_tracking="self")
+    async def embed(
+        self,
+        text: str,
+        prompt_name: str | None = None,
+        normalize_embeddings: bool = True,
+    ) -> _NDArray[_np.float32]:
+        """Embed a single text into a float32 vector.
+
+        Concurrent calls with the same ``prompt_name`` and ``normalize_embeddings``
+        are automatically batched by the underlying :meth:`_embed` decorator.
+
+        Args:
+            text: Text string to embed.
+            prompt_name: Prompt name for instruction following models that use
+                different prompts for queries vs documents.
+            normalize_embeddings: Whether to normalize embeddings to unit length.
+
+        Returns:
+            Numpy array of shape ``(dim,)`` containing the embedding vector.
+        """
+        result: _NDArray[_np.float32] = await self._embed(  # type: ignore[arg-type]
+            text, prompt_name, normalize_embeddings
+        )
+        return result
+
+    async def __coco_vector_schema__(self) -> _schema.VectorSchema:
         """Return vector schema information for this model.
 
         Returns:
             VectorSchema with the embedding dimension and dtype.
+
+        Raises:
+            RuntimeError: If the model's embedding dimension cannot be determined.
+        """
+        dim = await self.dimension()
+        return _schema.VectorSchema(dtype=_np.dtype(_np.float32), size=dim)
+
+    @coco.fn.as_async(runner=coco.GPU, memo=True)
+    def dimension(self) -> int:
+        """Return the embedding dimension for this model.
+
+        Returns:
+            The embedding dimension as an integer.
 
         Raises:
             RuntimeError: If the model's embedding dimension cannot be determined.
@@ -122,7 +177,7 @@ class SentenceTransformerEmbedder(_schema.VectorSchemaProvider):
             raise RuntimeError(
                 f"Embedding dimension is unknown for model {self._model_name_or_path}."
             )
-        return _schema.VectorSchema(dtype=_np.dtype(_np.float32), size=dim)
+        return int(dim)
 
     def __coco_memo_key__(self) -> object:
-        return (self._model_name_or_path, self._normalize_embeddings)
+        return (self._model_name_or_path, self._device, self._trust_remote_code)

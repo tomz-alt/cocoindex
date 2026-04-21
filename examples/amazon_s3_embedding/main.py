@@ -22,7 +22,6 @@ from aiobotocore.client import AioBaseClient
 from numpy.typing import NDArray
 
 import cocoindex as coco
-import cocoindex.asyncio as coco_aio
 from cocoindex.connectors import amazon_s3, postgres
 from cocoindex.ops.sentence_transformers import SentenceTransformerEmbedder
 from cocoindex.ops.text import RecursiveSplitter
@@ -42,19 +41,21 @@ TOP_K = 5
 S3_BUCKET = os.environ["S3_BUCKET"]
 S3_PREFIX = os.getenv("S3_PREFIX", "")
 
-PG_DB = coco.ContextKey[postgres.PgDatabase]("pg_db")
+EMBED_MODEL = "sentence-transformers/all-MiniLM-L6-v2"
+PG_DB = coco.ContextKey[asyncpg.Pool]("s3_embedding_db")
 S3_CLIENT = coco.ContextKey[AioBaseClient]("s3_client")
+EMBEDDER = coco.ContextKey[SentenceTransformerEmbedder]("embedder", detect_change=True)
 
-_embedder = SentenceTransformerEmbedder("sentence-transformers/all-MiniLM-L6-v2")
 _splitter = RecursiveSplitter()
 
 
-@coco_aio.lifespan
+@coco.lifespan
 async def coco_lifespan(
-    builder: coco_aio.EnvironmentBuilder,
+    builder: coco.EnvironmentBuilder,
 ) -> AsyncIterator[None]:
-    async with await postgres.create_pool(DATABASE_URL) as pool:
-        builder.provide(PG_DB, postgres.register_db("s3_embedding_db", pool))
+    async with await asyncpg.create_pool(DATABASE_URL) as pool:
+        builder.provide(PG_DB, pool)
+        builder.provide(EMBEDDER, SentenceTransformerEmbedder(EMBED_MODEL))
 
         # Create aiobotocore S3 client.
         # Set AWS_ENDPOINT_URL for S3-compatible services (e.g. MinIO).
@@ -71,10 +72,10 @@ class DocEmbedding:
     chunk_start: int
     chunk_end: int
     text: str
-    embedding: Annotated[NDArray, _embedder]
+    embedding: Annotated[NDArray, EMBEDDER]
 
 
-@coco.function
+@coco.fn
 async def process_chunk(
     chunk: Chunk,
     filename: str,
@@ -88,12 +89,12 @@ async def process_chunk(
             chunk_start=chunk.start.char_offset,
             chunk_end=chunk.end.char_offset,
             text=chunk.text,
-            embedding=await _embedder.embed(chunk.text),
+            embedding=await coco.use_context(EMBEDDER).embed(chunk.text),
         ),
     )
 
 
-@coco.function(memo=True)
+@coco.fn(memo=True)
 async def process_file(
     file: amazon_s3.S3File,
     table: postgres.TableTarget[DocEmbedding],
@@ -103,15 +104,13 @@ async def process_file(
         text, chunk_size=2000, chunk_overlap=500, language="markdown"
     )
     id_gen = IdGenerator()
-    await coco_aio.map(
-        process_chunk, chunks, file.file_path.path.as_posix(), id_gen, table
-    )
+    await coco.map(process_chunk, chunks, file.file_path.path.as_posix(), id_gen, table)
 
 
-@coco.function
+@coco.fn
 async def app_main() -> None:
-    target_db = coco.use_context(PG_DB)
-    target_table = await target_db.mount_table_target(
+    target_table = await postgres.mount_table_target(
+        PG_DB,
         table_name=TABLE_NAME,
         table_schema=await postgres.TableSchema.from_class(
             DocEmbedding,
@@ -127,11 +126,11 @@ async def app_main() -> None:
         prefix=S3_PREFIX,
         path_matcher=PatternFilePathMatcher(included_patterns=["**/*.md"]),
     )
-    await coco_aio.mount_each(process_file, files.items(), target_table)
+    await coco.mount_each(process_file, files.items(), target_table)
 
 
-app = coco_aio.App(
-    coco_aio.AppConfig(name="AmazonS3EmbeddingV1"),
+app = coco.App(
+    coco.AppConfig(name="AmazonS3EmbeddingV1"),
     app_main,
 )
 
@@ -141,8 +140,14 @@ app = coco_aio.App(
 # ============================================================================
 
 
-async def query_once(pool: asyncpg.Pool, query: str, *, top_k: int = TOP_K) -> None:
-    query_vec = await _embedder.embed(query)
+async def query_once(
+    pool: asyncpg.Pool,
+    embedder: SentenceTransformerEmbedder,
+    query: str,
+    *,
+    top_k: int = TOP_K,
+) -> None:
+    query_vec = await embedder.embed(query)
     async with pool.acquire() as conn:
         rows = await conn.fetch(
             f"""
@@ -166,17 +171,18 @@ async def query_once(pool: asyncpg.Pool, query: str, *, top_k: int = TOP_K) -> N
 
 
 async def query() -> None:
-    async with await postgres.create_pool(DATABASE_URL) as pool:
+    embedder = SentenceTransformerEmbedder(EMBED_MODEL)
+    async with await asyncpg.create_pool(DATABASE_URL) as pool:
         if len(sys.argv) > 2:
             q = " ".join(sys.argv[2:])
-            await query_once(pool, q)
+            await query_once(pool, embedder, q)
             return
 
         while True:
             q = input("Enter search query (or Enter to quit): ").strip()
             if not q:
                 break
-            await query_once(pool, q)
+            await query_once(pool, embedder, q)
 
 
 if __name__ == "__main__":

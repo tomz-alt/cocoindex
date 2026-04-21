@@ -1,9 +1,11 @@
+from __future__ import annotations
+
 import cocoindex as coco
-import cocoindex.asyncio as coco_aio
 import cocoindex.inspect as coco_inspect
 import pytest
 
-from typing import Any, Collection
+import dataclasses
+from typing import Any, Collection, Generic
 
 from tests import common
 from tests.common.target_states import DictsTarget, DictDataWithPrev, AsyncDictsTarget
@@ -16,10 +18,10 @@ _source_data: dict[str, dict[str, Any]] = {}
 ##################################################################################
 
 
-def _declare_dicts_data_together() -> None:
+async def _declare_dicts_data_together() -> None:
     with coco.component_subpath("dict"):
         for name, data in _source_data.items():
-            single_dict_provider = coco.use_mount(
+            single_dict_provider = await coco.use_mount(
                 coco.component_subpath(name),
                 DictsTarget.declare_dict_target,
                 name,
@@ -39,7 +41,7 @@ def test_dicts_data_together_insert() -> None:
 
     _source_data["D1"] = {"a": 1, "b": 2}
     _source_data["D2"] = {}
-    app.update()
+    app.update_blocking()
     assert DictsTarget.store.data == {
         "D1": {
             "a": DictDataWithPrev(data=1, prev=[], prev_may_be_missing=True),
@@ -52,7 +54,7 @@ def test_dicts_data_together_insert() -> None:
 
     _source_data["D2"]["c"] = 3
     _source_data["D3"] = {"a": 4}
-    app.update()
+    app.update_blocking()
     assert DictsTarget.store.data == {
         "D1": {
             "a": DictDataWithPrev(data=1, prev=[], prev_may_be_missing=True),
@@ -89,7 +91,7 @@ def test_dicts_data_together_delete_dict() -> None:
 
     _source_data["D1"] = {"a": 1, "b": 2}
     _source_data["D2"] = {}
-    app.update()
+    app.update_blocking()
     assert DictsTarget.store.data == {
         "D1": {
             "a": DictDataWithPrev(data=1, prev=[], prev_may_be_missing=True),
@@ -109,7 +111,7 @@ def test_dicts_data_together_delete_dict() -> None:
     del _source_data["D1"]
     _source_data["D2"]["c"] = 3
     _source_data["D3"] = {"a": 4}
-    app.update()
+    app.update_blocking()
     assert DictsTarget.store.data == {
         "D2": {
             "c": DictDataWithPrev(data=3, prev=[], prev_may_be_missing=True),
@@ -129,7 +131,7 @@ def test_dicts_data_together_delete_dict() -> None:
 
     # Re-insert after deletion
     _source_data["D1"] = {"a": 3, "c": 4}
-    app.update()
+    app.update_blocking()
     assert DictsTarget.store.data == {
         "D1": {
             "a": DictDataWithPrev(data=3, prev=[], prev_may_be_missing=True),
@@ -165,7 +167,7 @@ def test_dicts_data_together_delete_entry() -> None:
     )
 
     _source_data["D1"] = {"a": 1, "b": 2}
-    app.update()
+    app.update_blocking()
     assert DictsTarget.store.data == {
         "D1": {
             "a": DictDataWithPrev(data=1, prev=[], prev_may_be_missing=True),
@@ -176,7 +178,7 @@ def test_dicts_data_together_delete_entry() -> None:
     assert DictsTarget.store.collect_child_metrics() == {"sink": 1, "upsert": 2}
 
     del _source_data["D1"]["a"]
-    app.update()
+    app.update_blocking()
     assert DictsTarget.store.data == {
         "D1": {
             "b": DictDataWithPrev(data=2, prev=[], prev_may_be_missing=True),
@@ -188,7 +190,7 @@ def test_dicts_data_together_delete_entry() -> None:
     # Re-insert after deletion
     _source_data["D1"]["a"] = 3
     _source_data["D1"]["c"] = 4
-    app.update()
+    app.update_blocking()
     assert DictsTarget.store.data == {
         "D1": {
             "a": DictDataWithPrev(data=3, prev=[], prev_may_be_missing=True),
@@ -208,17 +210,17 @@ def test_dicts_data_together_delete_entry() -> None:
 ##################################################################################
 
 
-def _declare_one_dict(name: str) -> None:
-    dict_provider = coco.use_mount(
+async def _declare_one_dict(name: str) -> None:
+    dict_provider = await coco.use_mount(
         coco.component_subpath("setup"), DictsTarget.declare_dict_target, name
     )
     for key, value in _source_data[name].items():
         coco.declare_target_state(dict_provider.target_state(key, value))
 
 
-def _declare_dicts_in_sub_components() -> None:
+async def _declare_dicts_in_sub_components() -> None:
     for name in _source_data.keys():
-        coco.mount(coco.component_subpath(name), _declare_one_dict, name)
+        await coco.mount(coco.component_subpath(name), _declare_one_dict, name)
 
 
 def test_dicts_in_sub_components_insert() -> None:
@@ -234,7 +236,7 @@ def test_dicts_in_sub_components_insert() -> None:
 
     _source_data["D1"] = {"a": 1, "b": 2}
     _source_data["D2"] = {}
-    app.update()
+    app.update_blocking()
     assert DictsTarget.store.data == {
         "D1": {
             "a": DictDataWithPrev(data=1, prev=[], prev_may_be_missing=True),
@@ -247,7 +249,7 @@ def test_dicts_in_sub_components_insert() -> None:
 
     _source_data["D2"]["c"] = 3
     _source_data["D3"] = {"a": 4}
-    app.update()
+    app.update_blocking()
     assert DictsTarget.store.data == {
         "D1": {
             "a": DictDataWithPrev(data=1, prev=[], prev_may_be_missing=True),
@@ -286,7 +288,7 @@ def test_dicts_in_sub_components_delete_dict() -> None:
 
     _source_data["D1"] = {"a": 1, "b": 2}
     _source_data["D2"] = {}
-    app.update()
+    app.update_blocking()
     assert DictsTarget.store.data == {
         "D1": {
             "a": DictDataWithPrev(data=1, prev=[], prev_may_be_missing=True),
@@ -307,7 +309,7 @@ def test_dicts_in_sub_components_delete_dict() -> None:
     del _source_data["D1"]
     _source_data["D2"]["c"] = 3
     _source_data["D3"] = {"a": 4}
-    app.update()
+    app.update_blocking()
     assert DictsTarget.store.data == {
         "D2": {
             "c": DictDataWithPrev(data=3, prev=[], prev_may_be_missing=True),
@@ -328,7 +330,7 @@ def test_dicts_in_sub_components_delete_dict() -> None:
 
     # Re-insert after deletion
     _source_data["D1"] = {"a": 3, "c": 4}
-    app.update()
+    app.update_blocking()
     assert DictsTarget.store.data == {
         "D1": {
             "a": DictDataWithPrev(data=3, prev=[], prev_may_be_missing=True),
@@ -366,7 +368,7 @@ def test_dicts_in_sub_components_delete_entry() -> None:
     )
 
     _source_data["D1"] = {"a": 1, "b": 2}
-    app.update()
+    app.update_blocking()
     assert DictsTarget.store.data == {
         "D1": {
             "a": DictDataWithPrev(data=1, prev=[], prev_may_be_missing=True),
@@ -377,7 +379,7 @@ def test_dicts_in_sub_components_delete_entry() -> None:
     assert DictsTarget.store.collect_child_metrics() == {"sink": 1, "upsert": 2}
 
     del _source_data["D1"]["a"]
-    app.update()
+    app.update_blocking()
     assert DictsTarget.store.data == {
         "D1": {
             "b": DictDataWithPrev(data=2, prev=[], prev_may_be_missing=True),
@@ -389,7 +391,7 @@ def test_dicts_in_sub_components_delete_entry() -> None:
     # Re-insert after deletion
     _source_data["D1"]["a"] = 3
     _source_data["D1"]["c"] = 4
-    app.update()
+    app.update_blocking()
     assert DictsTarget.store.data == {
         "D1": {
             "a": DictDataWithPrev(data=3, prev=[], prev_may_be_missing=True),
@@ -409,11 +411,17 @@ def test_dicts_in_sub_components_delete_entry() -> None:
 ##################################################################################
 
 
+@dataclasses.dataclass
+class _DictContainers(Generic[coco.MaybePendingS], coco.ResolvesTo["_DictContainers"]):
+    providers: dict[str, coco.TargetStateProvider[str, None, coco.MaybePendingS]]
+
+
 def _declare_dict_containers(
     names: Collection[str],
-) -> dict[str, coco.PendingTargetStateProvider[str]]:
-    providers = {name: DictsTarget.declare_dict_target(name) for name in names}
-    return providers
+) -> _DictContainers[coco.PendingS]:
+    return _DictContainers[coco.PendingS](
+        providers={name: DictsTarget.declare_dict_target(name) for name in names}
+    )
 
 
 def _declare_one_dict_data(name: str, provider: coco.TargetStateProvider[str]) -> None:
@@ -421,15 +429,18 @@ def _declare_one_dict_data(name: str, provider: coco.TargetStateProvider[str]) -
         coco.declare_target_state(provider.target_state(key, value))
 
 
-def _declare_dict_containers_together() -> None:
-    providers = coco.use_mount(
+async def _declare_dict_containers_together() -> None:
+    containers = await coco.use_mount(
         coco.component_subpath("setup"), _declare_dict_containers, _source_data.keys()
     )
-    for name, provider in providers.items():
-        coco.mount(coco.component_subpath(name), _declare_one_dict_data, name, provider)
+    for name, provider in containers.providers.items():
+        await coco.mount(
+            coco.component_subpath(name), _declare_one_dict_data, name, provider
+        )
 
 
-def test_dicts_containers_together_insert() -> None:
+@pytest.mark.asyncio
+async def test_dicts_containers_together_insert() -> None:
     DictsTarget.store.clear()
     _source_data.clear()
 
@@ -442,196 +453,6 @@ def test_dicts_containers_together_insert() -> None:
 
     _source_data["D1"] = {"a": 1, "b": 2}
     _source_data["D2"] = {}
-    app.update()
-    assert DictsTarget.store.data == {
-        "D1": {
-            "a": DictDataWithPrev(data=1, prev=[], prev_may_be_missing=True),
-            "b": DictDataWithPrev(data=2, prev=[], prev_may_be_missing=True),
-        },
-        "D2": {},
-    }
-    assert DictsTarget.store.metrics.collect() == {"sink": 1, "insert": 2}
-    assert DictsTarget.store.collect_child_metrics() == {"sink": 1, "upsert": 2}
-
-    _source_data["D2"]["c"] = 3
-    _source_data["D3"] = {"a": 4}
-    app.update()
-    assert DictsTarget.store.data == {
-        "D1": {
-            "a": DictDataWithPrev(data=1, prev=[], prev_may_be_missing=True),
-            "b": DictDataWithPrev(data=2, prev=[], prev_may_be_missing=True),
-        },
-        "D2": {
-            "c": DictDataWithPrev(data=3, prev=[], prev_may_be_missing=True),
-        },
-        "D3": {
-            "a": DictDataWithPrev(data=4, prev=[], prev_may_be_missing=True),
-        },
-    }
-    assert DictsTarget.store.metrics.collect() == {"sink": 1, "insert": 1}
-    assert DictsTarget.store.collect_child_metrics() == {"sink": 2, "upsert": 2}
-    assert coco_inspect.list_stable_paths_sync(app) == [
-        coco.ROOT_PATH,
-        coco.ROOT_PATH / "D1",
-        coco.ROOT_PATH / "D2",
-        coco.ROOT_PATH / "D3",
-        coco.ROOT_PATH / "setup",
-    ]
-
-
-def test_dicts_containers_together_delete_dict() -> None:
-    DictsTarget.store.clear()
-    _source_data.clear()
-
-    app = coco.App(
-        coco.AppConfig(
-            name="test_dicts_containers_together_delete_dict", environment=coco_env
-        ),
-        _declare_dict_containers_together,
-    )
-
-    _source_data["D1"] = {"a": 1, "b": 2}
-    _source_data["D2"] = {}
-    app.update()
-    assert DictsTarget.store.data == {
-        "D1": {
-            "a": DictDataWithPrev(data=1, prev=[], prev_may_be_missing=True),
-            "b": DictDataWithPrev(data=2, prev=[], prev_may_be_missing=True),
-        },
-        "D2": {},
-    }
-    assert DictsTarget.store.metrics.collect() == {"sink": 1, "insert": 2}
-    assert DictsTarget.store.collect_child_metrics() == {"sink": 1, "upsert": 2}
-    assert coco_inspect.list_stable_paths_sync(app) == [
-        coco.ROOT_PATH,
-        coco.ROOT_PATH / "D1",
-        coco.ROOT_PATH / "D2",
-        coco.ROOT_PATH / "setup",
-    ]
-
-    del _source_data["D1"]
-    _source_data["D2"]["c"] = 3
-    _source_data["D3"] = {"a": 4}
-    app.update()
-    assert DictsTarget.store.data == {
-        "D2": {
-            "c": DictDataWithPrev(data=3, prev=[], prev_may_be_missing=True),
-        },
-        "D3": {
-            "a": DictDataWithPrev(data=4, prev=[], prev_may_be_missing=True),
-        },
-    }
-    assert DictsTarget.store.metrics.collect() == {"sink": 1, "insert": 1, "delete": 1}
-    assert DictsTarget.store.collect_child_metrics() == {"sink": 2, "upsert": 2}
-    assert coco_inspect.list_stable_paths_sync(app) == [
-        coco.ROOT_PATH,
-        coco.ROOT_PATH / "D2",
-        coco.ROOT_PATH / "D3",
-        coco.ROOT_PATH / "setup",
-    ]
-
-    # Re-insert after deletion
-    _source_data["D1"] = {"a": 3, "c": 4}
-    app.update()
-    assert DictsTarget.store.data == {
-        "D1": {
-            "a": DictDataWithPrev(data=3, prev=[], prev_may_be_missing=True),
-            "c": DictDataWithPrev(data=4, prev=[], prev_may_be_missing=True),
-        },
-        "D2": {
-            "c": DictDataWithPrev(data=3, prev=[], prev_may_be_missing=True),
-        },
-        "D3": {
-            "a": DictDataWithPrev(data=4, prev=[], prev_may_be_missing=True),
-        },
-    }
-    assert DictsTarget.store.metrics.collect() == {"sink": 1, "insert": 1}
-    assert DictsTarget.store.collect_child_metrics() == {"sink": 1, "upsert": 2}
-    assert coco_inspect.list_stable_paths_sync(app) == [
-        coco.ROOT_PATH,
-        coco.ROOT_PATH / "D1",
-        coco.ROOT_PATH / "D2",
-        coco.ROOT_PATH / "D3",
-        coco.ROOT_PATH / "setup",
-    ]
-
-
-def test_dicts_containers_together_delete_entry() -> None:
-    DictsTarget.store.clear()
-    _source_data.clear()
-
-    app = coco.App(
-        coco.AppConfig(
-            name="test_dicts_containers_together_delete_entry", environment=coco_env
-        ),
-        _declare_dict_containers_together,
-    )
-
-    _source_data["D1"] = {"a": 1, "b": 2}
-    app.update()
-    assert DictsTarget.store.data == {
-        "D1": {
-            "a": DictDataWithPrev(data=1, prev=[], prev_may_be_missing=True),
-            "b": DictDataWithPrev(data=2, prev=[], prev_may_be_missing=True),
-        },
-    }
-    assert DictsTarget.store.metrics.collect() == {"sink": 1, "insert": 1}
-    assert DictsTarget.store.collect_child_metrics() == {"sink": 1, "upsert": 2}
-
-    del _source_data["D1"]["a"]
-    app.update()
-    assert DictsTarget.store.data == {
-        "D1": {
-            "b": DictDataWithPrev(data=2, prev=[], prev_may_be_missing=True),
-        },
-    }
-    assert DictsTarget.store.metrics.collect() == {"sink": 1}
-    assert DictsTarget.store.collect_child_metrics() == {"sink": 1, "delete": 1}
-
-    # Re-insert after deletion
-    _source_data["D1"]["a"] = 3
-    _source_data["D1"]["c"] = 4
-    app.update()
-    assert DictsTarget.store.data == {
-        "D1": {
-            "a": DictDataWithPrev(data=3, prev=[], prev_may_be_missing=True),
-            "b": DictDataWithPrev(data=2, prev=[], prev_may_be_missing=True),
-            "c": DictDataWithPrev(data=4, prev=[], prev_may_be_missing=True),
-        },
-    }
-    assert DictsTarget.store.metrics.collect() == {"sink": 1}
-    assert DictsTarget.store.collect_child_metrics() == {"sink": 1, "upsert": 2}
-    assert coco_inspect.list_stable_paths_sync(app) == [
-        coco.ROOT_PATH,
-        coco.ROOT_PATH / "D1",
-        coco.ROOT_PATH / "setup",
-    ]
-
-
-async def _declare_dict_containers_together_async() -> None:
-    providers = await coco_aio.use_mount(
-        coco.component_subpath("setup"), _declare_dict_containers, _source_data.keys()
-    )
-    for name, provider in providers.items():
-        await coco_aio.mount(
-            coco.component_subpath(name), _declare_one_dict_data, name, provider
-        )
-
-
-@pytest.mark.asyncio
-async def test_dicts_containers_together_insert_async() -> None:
-    DictsTarget.store.clear()
-    _source_data.clear()
-
-    app = coco_aio.App(
-        coco.AppConfig(
-            name="test_dicts_containers_together_insert_async", environment=coco_env
-        ),
-        _declare_dict_containers_together_async,
-    )
-
-    _source_data["D1"] = {"a": 1, "b": 2}
-    _source_data["D2"] = {}
     await app.update()
     assert DictsTarget.store.data == {
         "D1": {
@@ -670,16 +491,16 @@ async def test_dicts_containers_together_insert_async() -> None:
 
 
 @pytest.mark.asyncio
-async def test_dicts_containers_together_delete_dict_async() -> None:
+async def test_dicts_containers_together_delete_dict() -> None:
     DictsTarget.store.clear()
     _source_data.clear()
 
-    app = coco_aio.App(
+    app = coco.App(
         coco.AppConfig(
-            name="test_dicts_containers_together_delete_dict_async",
+            name="test_dicts_containers_together_delete_dict",
             environment=coco_env,
         ),
-        _declare_dict_containers_together_async,
+        _declare_dict_containers_together,
     )
 
     _source_data["D1"] = {"a": 1, "b": 2}
@@ -742,16 +563,16 @@ async def test_dicts_containers_together_delete_dict_async() -> None:
 
 
 @pytest.mark.asyncio
-async def test_dicts_containers_together_delete_entry_async() -> None:
+async def test_dicts_containers_together_delete_entry() -> None:
     DictsTarget.store.clear()
     _source_data.clear()
 
-    app = coco_aio.App(
+    app = coco.App(
         coco.AppConfig(
-            name="test_dicts_containers_together_delete_entry_async",
+            name="test_dicts_containers_together_delete_entry",
             environment=coco_env,
         ),
-        _declare_dict_containers_together_async,
+        _declare_dict_containers_together,
     )
 
     _source_data["D1"] = {"a": 1, "b": 2}
@@ -812,11 +633,11 @@ def test_proceed_with_failed_creation() -> None:
     try:
         DictsTarget.store.sink_exception = True
         with pytest.raises(Exception):
-            app.update()
+            app.update_blocking()
     finally:
         DictsTarget.store.sink_exception = False
     assert DictsTarget.store.data == {}
-    app.update()
+    app.update_blocking()
     assert DictsTarget.store.data == {
         "D1": {
             "a": DictDataWithPrev(data=1, prev=[], prev_may_be_missing=True),
@@ -834,8 +655,8 @@ def test_proceed_with_failed_creation() -> None:
 # Test for cleanup of partially-built components
 
 
-def _declare_one_dict_w_exception(name: str) -> None:
-    dict_provider = coco.use_mount(
+async def _declare_one_dict_w_exception(name: str) -> None:
+    dict_provider = await coco.use_mount(
         coco.component_subpath("setup"), DictsTarget.declare_dict_target, name
     )
     for key, value in _source_data[name].items():
@@ -843,9 +664,11 @@ def _declare_one_dict_w_exception(name: str) -> None:
     raise ValueError("injected test exception (which is expected)")
 
 
-def _declare_dicts_in_sub_components_w_exception() -> None:
+async def _declare_dicts_in_sub_components_w_exception() -> None:
     for name in _source_data.keys():
-        coco.mount(coco.component_subpath(name), _declare_one_dict_w_exception, name)
+        await coco.mount(
+            coco.component_subpath(name), _declare_one_dict_w_exception, name
+        )
 
 
 def test_cleanup_partially_built_components() -> None:
@@ -860,7 +683,7 @@ def test_cleanup_partially_built_components() -> None:
     )
 
     _source_data["D1"] = {"a": 1}
-    app.update()
+    app.update_blocking()
     assert DictsTarget.store.data == {"D1": {}}
     assert coco_inspect.list_stable_paths_sync(app) == [
         coco.ROOT_PATH,
@@ -869,7 +692,7 @@ def test_cleanup_partially_built_components() -> None:
     ]
 
     del _source_data["D1"]
-    app.update()
+    app.update_blocking()
     assert DictsTarget.store.data == {}
     assert coco_inspect.list_stable_paths_sync(app) == [coco.ROOT_PATH]
 
@@ -890,7 +713,7 @@ def test_retry_from_gc_failed_components() -> None:
     )
 
     _source_data["D1"] = {}
-    app.update()
+    app.update_blocking()
     assert DictsTarget.store.data == {"D1": {}}
     assert coco_inspect.list_stable_paths_sync(app) == [
         coco.ROOT_PATH,
@@ -902,7 +725,7 @@ def test_retry_from_gc_failed_components() -> None:
     del _source_data["D1"]
     try:
         DictsTarget.store.sink_exception = True
-        app.update()
+        app.update_blocking()
     finally:
         DictsTarget.store.sink_exception = False
     assert DictsTarget.store.data == {"D1": {}}
@@ -912,7 +735,7 @@ def test_retry_from_gc_failed_components() -> None:
     ]
 
     # After retry, it should proceed with GC
-    app.update()
+    app.update_blocking()
     assert DictsTarget.store.data == {}
     assert coco_inspect.list_stable_paths_sync(app) == [
         coco.ROOT_PATH,
@@ -931,7 +754,7 @@ def test_restore_from_gc_failed_components() -> None:
     )
 
     _source_data["D1"] = {}
-    app.update()
+    app.update_blocking()
     assert DictsTarget.store.data == {"D1": {}}
     assert coco_inspect.list_stable_paths_sync(app) == [
         coco.ROOT_PATH,
@@ -943,7 +766,7 @@ def test_restore_from_gc_failed_components() -> None:
     del _source_data["D1"]
     DictsTarget.store.sink_exception = True
     try:
-        app.update()
+        app.update_blocking()
     finally:
         DictsTarget.store.sink_exception = False
     assert DictsTarget.store.data == {"D1": {}}
@@ -954,7 +777,7 @@ def test_restore_from_gc_failed_components() -> None:
 
     # The entry reappears, and the previous failed GC shouldn't affect it
     _source_data["D1"] = {"a": 1}
-    app.update()
+    app.update_blocking()
     assert DictsTarget.store.data == {
         "D1": {"a": DictDataWithPrev(data=1, prev=[], prev_may_be_missing=True)}
     }
@@ -970,9 +793,7 @@ def test_restore_from_gc_failed_components() -> None:
 
 
 async def _declare_dicts_in_sub_components_mount_each() -> None:
-    await coco_aio.mount_each(
-        _declare_one_dict, [(name, name) for name in _source_data]
-    )
+    await coco.mount_each(_declare_one_dict, [(name, name) for name in _source_data])
 
 
 @pytest.mark.asyncio
@@ -980,7 +801,7 @@ async def test_mount_each_insert() -> None:
     DictsTarget.store.clear()
     _source_data.clear()
 
-    app = coco_aio.App(
+    app = coco.App(
         coco.AppConfig(name="test_mount_each_insert", environment=coco_env),
         _declare_dicts_in_sub_components_mount_each,
     )
@@ -1015,14 +836,16 @@ async def test_mount_each_insert() -> None:
     }
     assert DictsTarget.store.metrics.collect() == {"sink": 3, "insert": 1}
     assert DictsTarget.store.collect_child_metrics() == {"sink": 2, "upsert": 2}
+    _me = coco.Symbol("_declare_one_dict")
     assert await coco_inspect.list_stable_paths(app) == [
         coco.ROOT_PATH,
-        coco.ROOT_PATH / "D1",
-        coco.ROOT_PATH / "D1" / "setup",
-        coco.ROOT_PATH / "D2",
-        coco.ROOT_PATH / "D2" / "setup",
-        coco.ROOT_PATH / "D3",
-        coco.ROOT_PATH / "D3" / "setup",
+        coco.ROOT_PATH / _me,
+        coco.ROOT_PATH / _me / "D1",
+        coco.ROOT_PATH / _me / "D1" / "setup",
+        coco.ROOT_PATH / _me / "D2",
+        coco.ROOT_PATH / _me / "D2" / "setup",
+        coco.ROOT_PATH / _me / "D3",
+        coco.ROOT_PATH / _me / "D3" / "setup",
     ]
 
 
@@ -1031,7 +854,7 @@ async def test_mount_each_delete() -> None:
     DictsTarget.store.clear()
     _source_data.clear()
 
-    app = coco_aio.App(
+    app = coco.App(
         coco.AppConfig(name="test_mount_each_delete", environment=coco_env),
         _declare_dicts_in_sub_components_mount_each,
     )
@@ -1054,12 +877,14 @@ async def test_mount_each_delete() -> None:
         },
     }
     assert DictsTarget.store.metrics.collect() == {"sink": 3, "insert": 1, "delete": 1}
+    _me = coco.Symbol("_declare_one_dict")
     assert await coco_inspect.list_stable_paths(app) == [
         coco.ROOT_PATH,
-        coco.ROOT_PATH / "D2",
-        coco.ROOT_PATH / "D2" / "setup",
-        coco.ROOT_PATH / "D3",
-        coco.ROOT_PATH / "D3" / "setup",
+        coco.ROOT_PATH / _me,
+        coco.ROOT_PATH / _me / "D2",
+        coco.ROOT_PATH / _me / "D2" / "setup",
+        coco.ROOT_PATH / _me / "D3",
+        coco.ROOT_PATH / _me / "D3" / "setup",
     ]
 
     # Re-insert after deletion
@@ -1080,12 +905,13 @@ async def test_mount_each_delete() -> None:
     assert DictsTarget.store.metrics.collect() == {"sink": 3, "insert": 1}
     assert await coco_inspect.list_stable_paths(app) == [
         coco.ROOT_PATH,
-        coco.ROOT_PATH / "D1",
-        coco.ROOT_PATH / "D1" / "setup",
-        coco.ROOT_PATH / "D2",
-        coco.ROOT_PATH / "D2" / "setup",
-        coco.ROOT_PATH / "D3",
-        coco.ROOT_PATH / "D3" / "setup",
+        coco.ROOT_PATH / _me,
+        coco.ROOT_PATH / _me / "D1",
+        coco.ROOT_PATH / _me / "D1" / "setup",
+        coco.ROOT_PATH / _me / "D2",
+        coco.ROOT_PATH / _me / "D2" / "setup",
+        coco.ROOT_PATH / _me / "D3",
+        coco.ROOT_PATH / _me / "D3" / "setup",
     ]
 
 
@@ -1095,7 +921,7 @@ async def test_mount_each_delete() -> None:
 
 async def _declare_async_dicts_data_together() -> None:
     for name, data in _source_data.items():
-        single_dict_provider = await coco_aio.use_mount(
+        single_dict_provider = await coco.use_mount(
             coco.component_subpath("dict", name),
             AsyncDictsTarget.declare_dict_target,
             name,
@@ -1109,7 +935,7 @@ async def test_async_dicts() -> None:
     AsyncDictsTarget.store.clear()
     _source_data.clear()
 
-    app = coco_aio.App(
+    app = coco.App(
         coco.AppConfig(name="test_async_dicts", environment=coco_env),
         _declare_async_dicts_data_together,
     )
@@ -1164,7 +990,7 @@ def test_async_dicts_sync_app() -> None:
 
     _source_data["D1"] = {"a": 1, "b": 2}
     _source_data["D2"] = {}
-    app.update()
+    app.update_blocking()
     assert AsyncDictsTarget.store.data == {
         "D1": {
             "a": DictDataWithPrev(data=1, prev=[], prev_may_be_missing=True),
@@ -1177,7 +1003,7 @@ def test_async_dicts_sync_app() -> None:
 
     _source_data["D2"]["c"] = 3
     _source_data["D3"] = {"a": 4}
-    app.update()
+    app.update_blocking()
     assert AsyncDictsTarget.store.data == {
         "D1": {
             "a": DictDataWithPrev(data=1, prev=[], prev_may_be_missing=True),
@@ -1202,7 +1028,7 @@ def test_async_dicts_sync_app() -> None:
 
 
 ##################################################################################
-# Tests for coco_aio.mount_target()
+# Tests for coco.mount_target()
 ##################################################################################
 
 
@@ -1212,7 +1038,7 @@ _mount_target_source_data: dict[str, dict[str, Any]] = {}
 async def _declare_dicts_with_mount_target() -> None:
     with coco.component_subpath("dict"):
         for name, data in _mount_target_source_data.items():
-            single_dict_provider = await coco_aio.mount_target(
+            single_dict_provider = await coco.mount_target(
                 DictsTarget.dict_target(name)
             )
             for key, value in data.items():
@@ -1230,7 +1056,7 @@ def test_mount_target_insert() -> None:
 
     _mount_target_source_data["D1"] = {"a": 1, "b": 2}
     _mount_target_source_data["D2"] = {}
-    app.update()
+    app.update_blocking()
     assert DictsTarget.store.data == {
         "D1": {
             "a": DictDataWithPrev(data=1, prev=[], prev_may_be_missing=True),
@@ -1258,7 +1084,7 @@ def test_mount_target_delete() -> None:
 
     _mount_target_source_data["D1"] = {"a": 1, "b": 2}
     _mount_target_source_data["D2"] = {"c": 3}
-    app.update()
+    app.update_blocking()
     assert DictsTarget.store.data == {
         "D1": {
             "a": DictDataWithPrev(data=1, prev=[], prev_may_be_missing=True),
@@ -1274,7 +1100,7 @@ def test_mount_target_delete() -> None:
     # Delete D2, modify D1
     del _mount_target_source_data["D2"]
     _mount_target_source_data["D1"]["c"] = 4
-    app.update()
+    app.update_blocking()
     assert DictsTarget.store.data == {
         "D1": {
             "a": DictDataWithPrev(data=1, prev=[], prev_may_be_missing=True),

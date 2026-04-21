@@ -1,26 +1,61 @@
 use crate::engine::profile::EngineProfile;
-use crate::engine::stats::{ProcessingStats, ProgressReporter};
+use crate::engine::stats::{ProcessingStats, VersionedProcessingStats};
 use crate::prelude::*;
 
 use crate::engine::component::Component;
 use crate::engine::context::AppContext;
 
 use crate::engine::environment::{AppRegistration, Environment};
+use crate::engine::runtime::{get_runtime, global_cancellation_token};
 use crate::state::stable_path::StablePath;
+use tokio::sync::watch;
 
 /// Options for updating an app.
 #[derive(Debug, Clone, Default)]
 pub struct AppUpdateOptions {
-    /// If true, periodically report processing stats to stdout.
-    pub report_to_stdout: bool,
     /// If true, reprocess everything and invalidate existing caches.
     pub full_reprocess: bool,
+    /// If true, enable live component mode for this update.
+    pub live: bool,
 }
 
-/// Options for dropping an app.
-#[derive(Debug, Clone, Default)]
-pub struct AppDropOptions {
-    pub report_to_stdout: bool,
+/// Handle returned by `App::update` or `App::drop_app` that provides access to
+/// the running operation's stats and result.
+pub struct AppOpHandle<T: Send + 'static> {
+    task: tokio::task::JoinHandle<Result<T>>,
+    stats: ProcessingStats,
+    version_rx: watch::Receiver<u64>,
+    /// Whether this is a live-mode operation (affects progress display).
+    pub live: bool,
+}
+
+impl<T: Send + 'static> AppOpHandle<T> {
+    /// Returns an atomic (version, stats) snapshot.
+    pub fn stats_snapshot(&self) -> VersionedProcessingStats {
+        self.stats.snapshot()
+    }
+
+    /// Returns the underlying `ProcessingStats` (Arc-based, safe to clone).
+    pub fn stats(&self) -> &ProcessingStats {
+        &self.stats
+    }
+
+    /// Waits for the version to change. Returns the new version.
+    /// Returns `TERMINATED_VERSION` when the task completes.
+    pub async fn changed(&mut self) -> Result<u64> {
+        self.version_rx
+            .changed()
+            .await
+            .map_err(|_| internal_error!("operation task dropped"))?;
+        Ok(*self.version_rx.borrow())
+    }
+
+    /// Awaits the task completion and returns the result.
+    pub async fn result(self) -> Result<T> {
+        self.task
+            .await
+            .map_err(|e| internal_error!("operation task panicked: {e}"))?
+    }
 }
 
 pub struct App<Prof: EngineProfile> {
@@ -35,6 +70,7 @@ impl<Prof: EngineProfile> App<Prof> {
     ) -> Result<Self> {
         let app_reg = AppRegistration::new(name, &env)?;
 
+        // TODO: This database initialization logic should happen lazily on first call to `update()`.
         let db = {
             let mut wtxn = env.db_env().write_txn()?;
             let db = env.db_env().create_database(&mut wtxn, Some(name))?;
@@ -43,51 +79,83 @@ impl<Prof: EngineProfile> App<Prof> {
         };
 
         let app_ctx = AppContext::new(env, db, app_reg, max_inflight_components);
-        let root_component = Component::new(app_ctx, StablePath::root());
+        let root_component = Component::new(app_ctx, StablePath::root(), None);
         Ok(Self { root_component })
     }
 }
 
 impl<Prof: EngineProfile> App<Prof> {
+    /// Starts an update and returns a handle for tracking progress and awaiting the result.
+    ///
+    /// The update runs as a spawned Tokio task. The handle provides:
+    /// - `stats_snapshot()` for polling current stats
+    /// - `changed()` for awaiting stats version changes
+    /// - `result()` for awaiting the final result
     #[instrument(name = "app.update", skip_all, fields(app_name = %self.app_ctx().app_reg().name()))]
-    pub async fn update(
+    pub fn update(
         &self,
         root_processor: Prof::ComponentProc,
         options: AppUpdateOptions,
-    ) -> Result<Prof::FunctionData> {
-        let processing_stats = ProcessingStats::default();
+        host_ctx: Arc<Prof::HostCtx>,
+    ) -> Result<AppOpHandle<Prof::FunctionData>> {
+        let processing_stats = ProcessingStats::new();
+        let version_rx = processing_stats.subscribe();
         let context = self.root_component.new_processor_context_for_build(
             None,
             processing_stats.clone(),
             options.full_reprocess,
+            options.live,
+            host_ctx,
         )?;
 
-        let run_fut = async {
-            self.root_component
-                .clone()
-                .run(root_processor, context)
-                .await?
-                .result(None)
-                .await
-        };
+        let root_component = self.root_component.clone();
+        let stats_for_task = processing_stats.clone();
+        let cancel_token = global_cancellation_token();
+        let live = options.live;
+        let span = Span::current();
+        let task = get_runtime().spawn(
+            async move {
+                let run_fut = async {
+                    root_component
+                        .clone()
+                        .run(root_processor, context)
+                        .await?
+                        .result(None)
+                        .await
+                };
+                let result = tokio::select! {
+                    result = run_fut => result,
+                    _ = cancel_token.cancelled() => Err(internal_error!("Operation cancelled")),
+                };
+                stats_for_task.notify_ready();
+                if live && result.is_ok() {
+                    // In live mode, wait for all descendants to finish before signaling termination.
+                    root_component.wait_until_inactive().await;
+                }
+                stats_for_task.notify_terminated();
+                result
+            }
+            .instrument(span),
+        );
 
-        if options.report_to_stdout {
-            let reporter = ProgressReporter::new(processing_stats);
-            reporter.run_with_progress(run_fut).await
-        } else {
-            run_fut.await
-        }
+        Ok(AppOpHandle {
+            task,
+            stats: processing_stats,
+            version_rx,
+            live,
+        })
     }
 
     /// Drop the app, reverting all target states and clearing the database.
     ///
-    /// This method:
-    /// 1. Deletes the root component (which cascades to delete all child components and their target states)
-    /// 2. Waits for deletion to complete
-    /// 3. Clears the app's database
+    /// Returns an `AppOpHandle<()>` for tracking progress and awaiting completion.
+    /// Synchronous setup (cancellation, context construction) happens before the spawn.
     #[instrument(name = "app.drop", skip_all, fields(app_name = %self.app_ctx().app_reg().name()))]
-    pub async fn drop_app(&self, options: AppDropOptions) -> Result<()> {
+    pub fn drop_app(&self, host_ctx: Arc<Prof::HostCtx>) -> Result<AppOpHandle<()>> {
+        self.app_ctx().cancellation_token().cancel();
+
         let processing_stats = ProcessingStats::default();
+        let version_rx = processing_stats.subscribe();
         let providers = self
             .app_ctx()
             .env()
@@ -101,31 +169,42 @@ impl<Prof: EngineProfile> App<Prof> {
             providers,
             None,
             processing_stats.clone(),
+            host_ctx,
         );
 
-        let drop_fut = async {
-            // Delete the root component
-            let handle = self.root_component.clone().delete(context.clone())?;
+        let root_component = self.root_component.clone();
+        let stats_for_task = processing_stats.clone();
+        let span = Span::current();
+        let task = get_runtime().spawn(
+            async move {
+                // Delete the root component
+                let handle = root_component.clone().delete(context.clone(), None)?;
 
-            // Wait for the drop operation to complete
-            handle.ready().await?;
+                // Wait for the drop operation to complete
+                handle.ready().await?;
 
-            // Clear the database
-            let db_env = self.app_ctx().env().db_env();
-            let mut wtxn = db_env.write_txn()?;
-            self.app_ctx().db().clear(&mut wtxn)?;
-            wtxn.commit()?;
+                // Clear the database
+                let db = root_component.app_ctx().db().clone();
+                root_component
+                    .app_ctx()
+                    .env()
+                    .txn_batcher()
+                    .run(move |wtxn| Ok(db.clear(wtxn)?))
+                    .await?;
 
-            info!("App dropped successfully");
-            Ok(())
-        };
+                info!("App dropped successfully");
+                stats_for_task.notify_terminated();
+                Ok(())
+            }
+            .instrument(span),
+        );
 
-        if options.report_to_stdout {
-            let reporter = ProgressReporter::new(processing_stats);
-            reporter.run_with_progress(drop_fut).await
-        } else {
-            drop_fut.await
-        }
+        Ok(AppOpHandle {
+            task,
+            stats: processing_stats,
+            version_rx,
+            live: false,
+        })
     }
 
     pub fn app_ctx(&self) -> &AppContext<Prof> {

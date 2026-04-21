@@ -30,13 +30,14 @@ _source_data: dict[str, SourceDataEntry] = {}
 _metrics = Metrics()
 
 
+@coco.unpickle_safe
 @dataclass(frozen=True)
 class SourceDataResult:
     name: str
     content: str
 
 
-@coco.function(memo=True)
+@coco.fn(memo=True)
 def _declare_dict_entry(entry: SourceDataEntry) -> None:
     # Track the actual number of component executions for this function.
     if entry.err:
@@ -45,13 +46,13 @@ def _declare_dict_entry(entry: SourceDataEntry) -> None:
     coco.declare_target_state(GlobalDictTarget.target_state(entry.name, entry.content))
 
 
-@coco.function
-def _declare_dict_data() -> None:
+@coco.fn
+async def _declare_dict_data() -> None:
     for entry in _source_data.values():
-        coco.mount(coco.component_subpath(entry.name), _declare_dict_entry, entry)
+        await coco.mount(coco.component_subpath(entry.name), _declare_dict_entry, entry)
 
 
-@coco.function(memo=True)
+@coco.fn(memo=True)
 def _declare_transform_dict_entry(entry: SourceDataEntry) -> SourceDataResult:
     if entry.err:
         raise Exception("injected test exception (which is expected)")
@@ -60,13 +61,13 @@ def _declare_transform_dict_entry(entry: SourceDataEntry) -> SourceDataResult:
     return SourceDataResult(name=entry.name, content=entry.content)
 
 
-@coco.function
-def _declare_transform_dict_data() -> list[SourceDataResult]:
+@coco.fn
+async def _declare_transform_dict_data() -> list[SourceDataResult]:
     # Deterministic ordering for stable assertions.
     results: list[SourceDataResult] = []
     for name in sorted(_source_data):
         entry = _source_data[name]
-        result = coco.use_mount(
+        result = await coco.use_mount(
             coco.component_subpath(entry.name), _declare_transform_dict_entry, entry
         )
         results.append(result)
@@ -86,7 +87,7 @@ def test_source_data_memo() -> None:
     _source_data["A"] = SourceDataEntry(name="A", version=1, content="contentA1")
     _source_data["B"] = SourceDataEntry(name="B", version=1, content="contentB1")
 
-    app.update()
+    app.update_blocking()
     # 2 children, each updates 1 key => 2 calls into _declare_source_data_entry.
     assert _metrics.collect() == {"calls": 2}
     assert GlobalDictTarget.store.data == {
@@ -97,7 +98,7 @@ def test_source_data_memo() -> None:
     # memo key no change, reprocessing should be skipped
     _source_data["A"] = SourceDataEntry(name="A", version=1, content="contentA2")
     _source_data["B"] = SourceDataEntry(name="B", version=2, content="contentB2")
-    app.update()
+    app.update_blocking()
     # A is skipped (memo hit), B runs (memo miss) => 1 call into _declare_source_data_entry.
     assert _metrics.collect() == {"calls": 1}
     assert GlobalDictTarget.store.data == {
@@ -109,7 +110,7 @@ def test_source_data_memo() -> None:
 
     # Test deletion and re-insertion.
     del _source_data["A"]
-    app.update()
+    app.update_blocking()
     assert _metrics.collect() == {}
     assert GlobalDictTarget.store.data == {
         "B": DictDataWithPrev(
@@ -118,7 +119,7 @@ def test_source_data_memo() -> None:
     }
 
     _source_data["A"] = SourceDataEntry(name="A", version=1, content="contentA2")
-    app.update()
+    app.update_blocking()
     assert _metrics.collect() == {"calls": 1}
     assert GlobalDictTarget.store.data == {
         "A": DictDataWithPrev(data="contentA2", prev=[], prev_may_be_missing=True),
@@ -133,9 +134,9 @@ def test_source_data_memo() -> None:
     _source_data["A"] = SourceDataEntry(
         name="A", version=2, content="contentA2", err=True
     )
-    app.update()
+    app.update_blocking()
     _source_data["A"] = SourceDataEntry(name="A", version=1, content="contentA3")
-    app.update()
+    app.update_blocking()
     assert _metrics.collect() == {"calls": 1}
     assert GlobalDictTarget.store.data == {
         "A": DictDataWithPrev(
@@ -158,7 +159,7 @@ def test_source_data_memo_cleanup() -> None:
     )
 
     _source_data["A"] = SourceDataEntry(name="A", version=1, content="contentA1")
-    app.update()
+    app.update_blocking()
     assert _metrics.collect() == {"calls": 1}
     assert GlobalDictTarget.store.data == {
         "A": DictDataWithPrev(data="contentA1", prev=[], prev_may_be_missing=True),
@@ -169,7 +170,7 @@ def test_source_data_memo_cleanup() -> None:
     ]
 
     del _source_data["A"]
-    app.update()
+    app.update_blocking()
     assert _metrics.collect() == {}
     assert GlobalDictTarget.store.data == {}
     assert coco_inspect.list_stable_paths_sync(app) == [coco.ROOT_PATH]
@@ -187,7 +188,7 @@ def test_source_data_memo_use_mount() -> None:
 
     _source_data["A"] = SourceDataEntry(name="A", version=1, content="contentA1")
     _source_data["B"] = SourceDataEntry(name="B", version=1, content="contentB1")
-    ret1 = app.update()
+    ret1 = app.update_blocking()
     assert _metrics.collect() == {"calls": 2}
     assert GlobalDictTarget.store.data == {
         "A": DictDataWithPrev(data="contentA1", prev=[], prev_may_be_missing=True),
@@ -201,7 +202,7 @@ def test_source_data_memo_use_mount() -> None:
     # A memo key unchanged => cached return is used; B changes => recomputed.
     _source_data["A"] = SourceDataEntry(name="A", version=1, content="contentA2")
     _source_data["B"] = SourceDataEntry(name="B", version=2, content="contentB2")
-    ret2 = app.update()
+    ret2 = app.update_blocking()
     assert _metrics.collect() == {"calls": 1}
     assert GlobalDictTarget.store.data == {
         "A": DictDataWithPrev(data="contentA1", prev=[], prev_may_be_missing=True),
@@ -215,7 +216,7 @@ def test_source_data_memo_use_mount() -> None:
     ]
 
     _source_data["A"] = SourceDataEntry(name="A", version=2, content="contentA2")
-    ret3 = app.update()
+    ret3 = app.update_blocking()
     assert _metrics.collect() == {"calls": 1}
     assert GlobalDictTarget.store.data == {
         "A": DictDataWithPrev(
@@ -232,7 +233,7 @@ def test_source_data_memo_use_mount() -> None:
 
     # Test deletion and re-insertion.
     del _source_data["A"]
-    ret4 = app.update()
+    ret4 = app.update_blocking()
     assert _metrics.collect() == {}
     assert GlobalDictTarget.store.data == {
         "B": DictDataWithPrev(
@@ -244,7 +245,7 @@ def test_source_data_memo_use_mount() -> None:
     ]
 
     _source_data["A"] = SourceDataEntry(name="A", version=1, content="contentA2")
-    ret5 = app.update()
+    ret5 = app.update_blocking()
     assert _metrics.collect() == {"calls": 1}
     assert GlobalDictTarget.store.data == {
         "A": DictDataWithPrev(data="contentA2", prev=[], prev_may_be_missing=True),
@@ -264,9 +265,9 @@ def test_source_data_memo_use_mount() -> None:
         name="A", version=2, content="contentA2", err=True
     )
     with pytest.raises(Exception):
-        app.update()
+        app.update_blocking()
     _source_data["A"] = SourceDataEntry(name="A", version=1, content="contentA3")
-    ret6 = app.update()
+    ret6 = app.update_blocking()
     assert _metrics.collect() == {"calls": 1}
     assert GlobalDictTarget.store.data == {
         "A": DictDataWithPrev(
@@ -295,7 +296,7 @@ def test_source_data_memo_use_mount_cleanup() -> None:
     )
 
     _source_data["A"] = SourceDataEntry(name="A", version=1, content="contentA1")
-    ret1 = app.update()
+    ret1 = app.update_blocking()
     assert ret1 == [
         SourceDataResult(name="A", content="contentA1"),
     ]
@@ -309,7 +310,7 @@ def test_source_data_memo_use_mount_cleanup() -> None:
     ]
 
     del _source_data["A"]
-    ret2 = app.update()
+    ret2 = app.update_blocking()
     assert ret2 == []
     assert _metrics.collect() == {}
     assert GlobalDictTarget.store.data == {}
@@ -343,10 +344,10 @@ def test_memo_invalidation_on_decorator_change() -> None:
     # Use a mutable container to hold the current module's function.
     current_module: list[object] = []
 
-    @coco.function
-    def app_main() -> None:
+    @coco.fn
+    async def app_main() -> None:
         mod = current_module[0]
-        coco.mount(coco.component_subpath("A"), mod.process_entry, "A", "value1")  # type: ignore[attr-defined]
+        await coco.mount(coco.component_subpath("A"), mod.process_entry, "A", "value1")  # type: ignore[attr-defined, call-overload]
 
     app = coco.App(
         coco.AppConfig(
@@ -361,9 +362,9 @@ def test_memo_invalidation_on_decorator_change() -> None:
     current_module.clear()
     current_module.append(mod_with)
 
-    app.update()
+    app.update_blocking()
     assert metrics.collect() == {"calls": 1}
-    app.update()
+    app.update_blocking()
     assert metrics.collect() == {}
 
     # Step 2: Load without memo=True and run.
@@ -372,9 +373,9 @@ def test_memo_invalidation_on_decorator_change() -> None:
     current_module.clear()
     current_module.append(mod_without)
 
-    app.update()
+    app.update_blocking()
     assert metrics.collect() == {"calls": 1}
-    app.update()
+    app.update_blocking()
     assert metrics.collect() == {"calls": 1}
 
     # Step 3: Load with memo=True again and run.
@@ -383,11 +384,118 @@ def test_memo_invalidation_on_decorator_change() -> None:
     current_module.clear()
     current_module.append(mod_with_again)
 
-    app.update()
+    app.update_blocking()
     assert metrics.collect() == {"calls": 1}
-    app.update()
+    app.update_blocking()
     assert metrics.collect() == {}
 
     # Cleanup fake module from sys.modules.
     if fake_module_name in sys.modules:
         del sys.modules[fake_module_name]
+
+
+# ============================================================================
+# Bound method memo tests — verifies that @coco.fn(memo=True) on a class method
+# is respected when the bound method is passed to mount() / use_mount().
+# ============================================================================
+
+
+class _MemoMethodComponent:
+    @coco.fn(memo=True)
+    def declare_entry(self, entry: SourceDataEntry) -> None:
+        _metrics.increment("calls")
+        coco.declare_target_state(
+            GlobalDictTarget.target_state(entry.name, entry.content)
+        )
+
+
+_memo_method_obj = _MemoMethodComponent()
+
+
+@coco.fn
+async def _mount_bound_method() -> None:
+    for entry in _source_data.values():
+        await coco.mount(
+            coco.component_subpath(entry.name), _memo_method_obj.declare_entry, entry
+        )
+
+
+def test_bound_method_memo_with_mount() -> None:
+    """@coco.fn(memo=True) on a bound method should be respected in mount()."""
+    GlobalDictTarget.store.clear()
+    _source_data.clear()
+    _metrics.clear()
+
+    app = coco.App(
+        coco.AppConfig(name="test_bound_method_memo_mount", environment=coco_env),
+        _mount_bound_method,
+    )
+
+    _source_data["A"] = SourceDataEntry(name="A", version=1, content="contentA1")
+    _source_data["B"] = SourceDataEntry(name="B", version=1, content="contentB1")
+    app.update_blocking()
+    assert _metrics.collect() == {"calls": 2}
+
+    # A unchanged (version=1), B changed (version=2) — A should be memoized.
+    _source_data["A"] = SourceDataEntry(name="A", version=1, content="contentA2")
+    _source_data["B"] = SourceDataEntry(name="B", version=2, content="contentB2")
+    app.update_blocking()
+    assert _metrics.collect() == {"calls": 1}  # Only B re-executes
+
+
+class _MemoMethodReturnComponent:
+    @coco.fn(memo=True)
+    def declare_transform_entry(self, entry: SourceDataEntry) -> SourceDataResult:
+        _metrics.increment("calls")
+        coco.declare_target_state(
+            GlobalDictTarget.target_state(entry.name, entry.content)
+        )
+        return SourceDataResult(name=entry.name, content=entry.content)
+
+
+_memo_method_return_obj = _MemoMethodReturnComponent()
+
+
+@coco.fn
+async def _use_mount_bound_method() -> list[SourceDataResult]:
+    results: list[SourceDataResult] = []
+    for name in sorted(_source_data):
+        entry = _source_data[name]
+        result = await coco.use_mount(
+            coco.component_subpath(entry.name),
+            _memo_method_return_obj.declare_transform_entry,
+            entry,
+        )
+        results.append(result)
+    return results
+
+
+def test_bound_method_memo_with_use_mount() -> None:
+    """@coco.fn(memo=True) on a bound method should be respected in use_mount()."""
+    GlobalDictTarget.store.clear()
+    _source_data.clear()
+    _metrics.clear()
+
+    app = coco.App(
+        coco.AppConfig(name="test_bound_method_memo_use_mount", environment=coco_env),
+        _use_mount_bound_method,
+    )
+
+    _source_data["A"] = SourceDataEntry(name="A", version=1, content="contentA1")
+    _source_data["B"] = SourceDataEntry(name="B", version=1, content="contentB1")
+    ret1 = app.update_blocking()
+    assert _metrics.collect() == {"calls": 2}
+    assert ret1 == [
+        SourceDataResult(name="A", content="contentA1"),
+        SourceDataResult(name="B", content="contentB1"),
+    ]
+
+    # A unchanged, B changed — A should return cached result.
+    _source_data["A"] = SourceDataEntry(name="A", version=1, content="contentA2")
+    _source_data["B"] = SourceDataEntry(name="B", version=2, content="contentB2")
+    ret2 = app.update_blocking()
+    assert _metrics.collect() == {"calls": 1}  # Only B re-executes
+    assert ret2 == [
+        SourceDataResult(name="A", content="contentA1"),  # Cached
+        SourceDataResult(name="B", content="contentB2"),
+    ]

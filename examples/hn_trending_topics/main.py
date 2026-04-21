@@ -20,7 +20,6 @@ import asyncpg
 from litellm import acompletion
 
 import cocoindex as coco
-import cocoindex.asyncio as coco_aio
 from cocoindex.connectors import postgres
 
 from models import TopicsResponse
@@ -36,7 +35,7 @@ LLM_MODEL = "gemini/gemini-2.5-flash"
 THREAD_LEVEL_MENTION_SCORE = 5
 COMMENT_LEVEL_MENTION_SCORE = 1
 
-PG_DB = coco.ContextKey[postgres.PgDatabase]("pg_db")
+PG_DB = coco.ContextKey[asyncpg.Pool]("hn_db")
 
 
 # ============================================================================
@@ -96,7 +95,7 @@ class HnTopic:
 # ============================================================================
 
 
-@coco.function
+@coco.fn
 async def extract_topics(text: str | None) -> list[str]:
     """Extract topics from text using LLM."""
     if not text or not text.strip():
@@ -185,14 +184,14 @@ async def fetch_thread(session: aiohttp.ClientSession, thread_id: str) -> Thread
 # ============================================================================
 
 
-@coco_aio.lifespan
-async def coco_lifespan(builder: coco_aio.EnvironmentBuilder) -> AsyncIterator[None]:
+@coco.lifespan
+async def coco_lifespan(builder: coco.EnvironmentBuilder) -> AsyncIterator[None]:
     """Set up CocoIndex environment with PostgreSQL database."""
     # For CocoIndex internal states
     builder.settings.db_path = pathlib.Path("./cocoindex.db")
     # Provide resources needed across the CocoIndex environment
     async with await asyncpg.create_pool(DATABASE_URL) as pool:
-        builder.provide(PG_DB, postgres.register_db("hn_db", pool))
+        builder.provide(PG_DB, pool)
         yield
 
 
@@ -204,7 +203,7 @@ class TableTargets:
     topics: postgres.TableTarget[HnTopic]
 
 
-@coco.function
+@coco.fn
 async def process_thread(
     thread_id: str,
     targets: TableTargets,
@@ -266,7 +265,7 @@ async def process_thread(
             )
 
 
-@coco.function
+@coco.fn
 async def app_main() -> None:
     """Main pipeline function."""
     print("Starting HackerNews Trending Topics Pipeline")
@@ -275,15 +274,16 @@ async def app_main() -> None:
     print()
 
     # Set up table targets
-    target_db = coco.use_context(PG_DB)
-    messages_table = await target_db.mount_table_target(
+    messages_table = await postgres.mount_table_target(
+        PG_DB,
         table_name="hn_messages",
         table_schema=await postgres.TableSchema.from_class(
             HnMessage, primary_key=["id"]
         ),
         pg_schema_name="coco_examples",
     )
-    topics_table = await target_db.mount_table_target(
+    topics_table = await postgres.mount_table_target(
+        PG_DB,
         table_name="hn_topics",
         table_schema=await postgres.TableSchema.from_class(
             HnTopic, primary_key=["topic", "message_id"]
@@ -297,17 +297,15 @@ async def app_main() -> None:
         thread_ids = await fetch_thread_list(session)
 
     # Process threads (each component fetches its own thread data)
-    await coco_aio.mount_each(
-        process_thread, ((tid, tid) for tid in thread_ids), targets
-    )
+    await coco.mount_each(process_thread, ((tid, tid) for tid in thread_ids), targets)
 
 
 # ============================================================================
 # App definition
 # ============================================================================
 
-app = coco_aio.App(
-    coco_aio.AppConfig(name="HNTrendingTopics"),
+app = coco.App(
+    coco.AppConfig(name="HNTrendingTopics"),
     app_main,
 )
 

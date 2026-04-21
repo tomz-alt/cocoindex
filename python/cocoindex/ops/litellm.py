@@ -11,13 +11,12 @@ __all__ = ["LiteLLMEmbedder", "litellm"]
 import asyncio as _asyncio
 from typing import Any as _Any
 
+import litellm as litellm
 import numpy as _np
 from numpy.typing import NDArray as _NDArray
 
-import cocoindex.asyncio as coco_aio
+import cocoindex as coco
 from cocoindex.resources import schema as _schema
-
-import litellm as litellm
 
 
 class LiteLLMEmbedder(_schema.VectorSchemaProvider):
@@ -79,29 +78,60 @@ class LiteLLMEmbedder(_schema.VectorSchemaProvider):
             self._dim = len(embedding)
             return self._dim
 
-    @coco_aio.function(batching=True, memo=True, max_batch_size=64, version=1)
-    async def embed(self, texts: list[str]) -> list[_NDArray[_np.float32]]:
-        """Embed texts to embedding vectors.
-
-        With batching enabled, this function receives a batch of texts and returns
-        a batch of embeddings. The external signature is still single text -> single embedding.
+    @coco.fn.as_async(batching=True, max_batch_size=64)  # type: ignore[arg-type]
+    async def _embed(
+        self,
+        texts: list[str],
+        input_type: str | None = None,
+    ) -> list[_NDArray[_np.float32]]:
+        """Batched embedding. Concurrent single-text calls into :meth:`embed`
+        are grouped by the ``@coco.fn.as_async(batching=True)`` decorator;
+        this method is the per-batch body invoked by the decorator.
 
         Args:
-            texts: List of text strings to embed (batched input).
+            texts: Batch of text strings to embed (handled by the engine).
+            input_type: Input type for asymmetric embedding models (e.g.,
+                Cohere's ``"search_query"`` / ``"search_document"``).
 
-        Returns:
-            List of numpy arrays, each of shape (dim,) containing an embedding vector.
+        Note:
+            Pass ``input_type`` consistently across calls — mixing explicit
+            values with the default creates separate batchers.
         """
+        kwargs = dict(self._kwargs)
+        if input_type is not None:
+            kwargs["input_type"] = input_type
         response = await litellm.aembedding(
             model=self._model,
             input=texts,
-            **self._kwargs,
+            **kwargs,
         )
         return [
             _np.array(item["embedding"], dtype=_np.float32) for item in response.data
         ]
 
-    @coco_aio.function(memo=True)
+    @coco.fn(memo=True, version=1, logic_tracking="self")
+    async def embed(
+        self,
+        text: str,
+        input_type: str | None = None,
+    ) -> _NDArray[_np.float32]:
+        """Embed a single text into a float32 vector.
+
+        Concurrent calls with the same ``input_type`` are automatically
+        batched by the underlying :meth:`_embed` decorator.
+
+        Args:
+            text: Text string to embed.
+            input_type: Input type for asymmetric embedding models (e.g.,
+                Cohere's ``"search_query"`` / ``"search_document"``).
+
+        Returns:
+            Numpy array of shape ``(dim,)`` containing the embedding vector.
+        """
+        result: _NDArray[_np.float32] = await self._embed(text, input_type)  # type: ignore[arg-type]
+        return result
+
+    @coco.fn(memo=True)
     async def __coco_vector_schema__(self) -> _schema.VectorSchema:
         """Return vector schema information for this model.
 

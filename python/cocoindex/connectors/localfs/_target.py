@@ -9,11 +9,14 @@ from dataclasses import dataclass
 from typing import Collection, Generic, Literal, NamedTuple, Sequence, cast
 
 import cocoindex as coco
-from cocoindex._internal.api_async import mount_target as _mount_target
 from cocoindex.connectorkits.fingerprint import fingerprint_bytes
 from cocoindex._internal.datatype import TypeChecker
 
-from ._common import FilePath, CWD_BASE_DIR, path_registry, to_file_path
+import msgspec
+
+from cocoindex._internal.context_keys import ContextKey, ContextProvider
+
+from ._common import FilePath, to_file_path
 
 # =============================================================================
 # Shared types and helpers
@@ -28,7 +31,10 @@ _FileFingerprint = bytes
 class _EntryAction(NamedTuple):
     """Action to perform on a file or directory entry."""
 
-    path: pathlib.Path  # Absolute path to the entry
+    base_dir_key: (
+        str | None
+    )  # Context key for base dir; None means path is already absolute
+    path: str  # Absolute path string if base_dir_key is None; relative path otherwise
     entry_type: Literal["file", "dir"]
     content: _FileContent | None  # For files; None means delete
     create_parents: bool  # Whether to create parent directories
@@ -49,14 +55,14 @@ class _EntrySpec:
     create_parent_dirs: bool
 
 
-def _execute_entry_action(action: _EntryAction) -> pathlib.Path | None:
+def _execute_entry_action(
+    path: pathlib.Path, action: _EntryAction
+) -> pathlib.Path | None:
     """
     Execute a single entry action.
 
     Returns the path for directories (to create child handler), None otherwise.
     """
-    path = action.path
-
     if action.content is None:
         # Delete
         if action.entry_type == "file":
@@ -82,12 +88,19 @@ def _execute_entry_action(action: _EntryAction) -> pathlib.Path | None:
 
 
 def _apply_actions_with_child(
+    context_provider: ContextProvider,
     actions: Sequence[_EntryAction],
+    /,
 ) -> list[coco.ChildTargetDef["_EntryHandler"] | None]:
     """Apply actions and return child handlers for directories."""
     outputs: list[coco.ChildTargetDef[_EntryHandler] | None] = []
     for action in actions:
-        result_path = _execute_entry_action(action)
+        if action.base_dir_key is not None:
+            base = context_provider.get(action.base_dir_key, pathlib.Path)
+            path = (base / action.path).resolve()
+        else:
+            path = pathlib.Path(action.path)  # already absolute
+        result_path = _execute_entry_action(path, action)
         if result_path is not None:
             outputs.append(coco.ChildTargetDef(handler=_EntryHandler(result_path)))
         else:
@@ -102,9 +115,10 @@ _action_sink_with_child = coco.TargetActionSink[
 
 
 def _reconcile_entry(
-    path: pathlib.Path,
+    base_dir_key: str | None,
+    path_str: str,
     desired_state: _EntrySpec | coco.NonExistenceType,
-    prev_possible_states: Collection[_EntryTrackingRecord],
+    prev_possible_records: Collection[_EntryTrackingRecord],
     prev_may_be_missing: bool,
 ) -> (
     coco.TargetReconcileOutput[_EntryAction, _EntryTrackingRecord, "_EntryHandler"]
@@ -114,18 +128,13 @@ def _reconcile_entry(
     if coco.is_non_existence(desired_state):
         # Determine entry type from previous state (None fingerprint = dir)
         entry_type: Literal["file", "dir"] = "file"
-        for prev in prev_possible_states:
+        for prev in prev_possible_records:
             if prev.fingerprint is None:
                 entry_type = "dir"
                 break
 
         return coco.TargetReconcileOutput(
-            action=_EntryAction(
-                path=path,
-                entry_type=entry_type,
-                content=None,
-                create_parents=False,
-            ),
+            action=_EntryAction(base_dir_key, path_str, entry_type, None, False),
             sink=_action_sink_with_child,
             tracking_record=coco.NON_EXISTENCE,
         )
@@ -136,12 +145,7 @@ def _reconcile_entry(
     if isinstance(entry_spec, _DirSpec):
         # Directory entry (fingerprint=None means directory)
         return coco.TargetReconcileOutput(
-            action=_EntryAction(
-                path=path,
-                entry_type="dir",
-                content=b"",  # Non-None to indicate creation
-                create_parents=create_parents,
-            ),
+            action=_EntryAction(base_dir_key, path_str, "dir", b"", create_parents),
             sink=_action_sink_with_child,
             tracking_record=_EntryTrackingRecord(fingerprint=None),
         )
@@ -151,17 +155,12 @@ def _reconcile_entry(
 
     # Check if update needed
     if not prev_may_be_missing and all(
-        prev.fingerprint == target_fp for prev in prev_possible_states
+        prev.fingerprint == target_fp for prev in prev_possible_records
     ):
         return None
 
     return coco.TargetReconcileOutput(
-        action=_EntryAction(
-            path=path,
-            entry_type="file",
-            content=entry_spec,
-            create_parents=create_parents,
-        ),
+        action=_EntryAction(base_dir_key, path_str, "file", entry_spec, create_parents),
         sink=_action_sink_with_child,
         tracking_record=_EntryTrackingRecord(fingerprint=target_fp),
     )
@@ -172,8 +171,7 @@ def _reconcile_entry(
 # =============================================================================
 
 
-@dataclass(frozen=True, slots=True)
-class _EntryTrackingRecord:
+class _EntryTrackingRecord(msgspec.Struct, frozen=True):
     """Tracking record for an entry. If fingerprint is None, it's a directory."""
 
     fingerprint: _FileFingerprint | None
@@ -195,7 +193,7 @@ class _EntryHandler(
         self,
         key: coco.StableKey,
         desired_state: _EntrySpec | coco.NonExistenceType,
-        prev_possible_states: Collection[_EntryTrackingRecord],
+        prev_possible_records: Collection[_EntryTrackingRecord],
         prev_may_be_missing: bool,
         /,
     ) -> (
@@ -205,7 +203,11 @@ class _EntryHandler(
         key = _ENTRY_NAME_CHECKER.check(key)
         path = self._base_path / key
         return _reconcile_entry(
-            path, desired_state, prev_possible_states, prev_may_be_missing
+            None,
+            str(path),
+            desired_state,
+            prev_possible_records,
+            prev_may_be_missing,
         )
 
 
@@ -225,24 +227,14 @@ _ROOT_KEY_CHECKER = TypeChecker(tuple[str | None, str])
 
 
 def _get_base_dir_key(file_path: FilePath) -> str | None:
-    """Get the base directory key, returning None for CWD (empty string)."""
-    key = file_path.base_dir.key
-    return key if key else None
+    """Get the base directory key, returning None for CWD."""
+    base_dir = file_path.base_dir
+    return base_dir.key if base_dir is not None else None
 
 
 # =============================================================================
 # Root handler (for root-level files and directories)
 # =============================================================================
-
-
-def _resolve_root_path(key: _RootKey) -> pathlib.Path:
-    """Resolve a root key to an absolute path using the current base directory."""
-    if key.base_dir_key is None:
-        # CWD
-        base_path = CWD_BASE_DIR.value
-    else:
-        base_path = path_registry.get(key.base_dir_key)
-    return (base_path / key.path).resolve()
 
 
 class _RootHandler(coco.TargetHandler[_EntrySpec, _EntryTrackingRecord, _EntryHandler]):
@@ -252,18 +244,24 @@ class _RootHandler(coco.TargetHandler[_EntrySpec, _EntryTrackingRecord, _EntryHa
         self,
         key: coco.StableKey,
         desired_state: _EntrySpec | coco.NonExistenceType,
-        prev_possible_states: Collection[_EntryTrackingRecord],
+        prev_possible_records: Collection[_EntryTrackingRecord],
         prev_may_be_missing: bool,
         /,
     ) -> (
         coco.TargetReconcileOutput[_EntryAction, _EntryTrackingRecord, _EntryHandler]
         | None
     ):
-        key = _RootKey(*_ROOT_KEY_CHECKER.check(key))
-
-        path = _resolve_root_path(key)
+        root_key = _RootKey(*_ROOT_KEY_CHECKER.check(key))
+        if root_key.base_dir_key is None:
+            path_str = str((pathlib.Path.cwd() / root_key.path).resolve())
+        else:
+            path_str = root_key.path
         return _reconcile_entry(
-            path, desired_state, prev_possible_states, prev_may_be_missing
+            root_key.base_dir_key,
+            path_str,
+            desired_state,
+            prev_possible_records,
+            prev_may_be_missing,
         )
 
 
@@ -354,9 +352,9 @@ class DirTarget(Generic[coco.MaybePendingS], coco.ResolvesTo["DirTarget"]):
         return self._provider.memo_key
 
 
-@coco.function
+@coco.fn
 def declare_dir_target(
-    path: FilePath | pathlib.Path,
+    path: FilePath | pathlib.Path | ContextKey[pathlib.Path],
     *,
     create_parent_dirs: bool = True,
 ) -> DirTarget[coco.PendingS]:
@@ -364,8 +362,9 @@ def declare_dir_target(
     Declare a directory target for writing files.
 
     Args:
-        path: The filesystem path for the directory. Can be a FilePath (with stable
-            base directory key) or a pathlib.Path (uses CWD as base directory).
+        path: The filesystem path for the directory. Can be a FilePath, a
+            pathlib.Path (uses CWD as base directory), or a ContextKey[Path]
+            (equivalent to FilePath(base_dir=path)).
         create_parent_dirs: If True, create parent directories if they don't exist.
             Defaults to True.
 
@@ -390,19 +389,20 @@ def declare_dir_target(
 
 
 def dir_target(
-    path: FilePath | pathlib.Path,
+    path: FilePath | pathlib.Path | ContextKey[pathlib.Path],
     *,
     create_parent_dirs: bool = True,
 ) -> coco.TargetState[_EntryHandler]:
     """
     Create a TargetState for a local directory target.
 
-    Use with ``coco_aio.mount_target()`` to mount and get a child provider,
+    Use with ``coco.mount_target()`` to mount and get a child provider,
     or with ``mount_dir_target()`` for a convenience wrapper.
 
     Args:
-        path: The filesystem path for the directory. Can be a FilePath (with stable
-            base directory key) or a pathlib.Path (uses CWD as base directory).
+        path: The filesystem path for the directory. Can be a FilePath, a
+            pathlib.Path (uses CWD as base directory), or a ContextKey[Path]
+            (equivalent to FilePath(base_dir=path)).
         create_parent_dirs: If True, create parent directories if they don't exist.
             Defaults to True.
 
@@ -422,33 +422,34 @@ def dir_target(
 
 
 async def mount_dir_target(
-    path: FilePath | pathlib.Path,
+    path: FilePath | pathlib.Path | ContextKey[pathlib.Path],
     *,
     create_parent_dirs: bool = True,
 ) -> DirTarget[coco.ResolvedS]:
     """
     Mount a directory target and return a ready-to-use DirTarget.
 
-    Sugar over ``dir_target()`` + ``coco_aio.mount_target()`` + wrapping.
+    Sugar over ``dir_target()`` + ``coco.mount_target()`` + wrapping.
 
     Args:
-        path: The filesystem path for the directory. Can be a FilePath (with stable
-            base directory key) or a pathlib.Path (uses CWD as base directory).
+        path: The filesystem path for the directory. Can be a FilePath, a
+            pathlib.Path (uses CWD as base directory), or a ContextKey[Path]
+            (equivalent to FilePath(base_dir=path)).
         create_parent_dirs: If True, create parent directories if they don't exist.
             Defaults to True.
 
     Returns:
         A DirTarget that can be used to declare files and subdirectories.
     """
-    provider = await _mount_target(
+    provider = await coco.mount_target(
         dir_target(path, create_parent_dirs=create_parent_dirs)
     )
     return DirTarget(provider)
 
 
-@coco.function
+@coco.fn
 def declare_file(
-    path: FilePath | pathlib.Path,
+    path: FilePath | pathlib.Path | ContextKey[pathlib.Path],
     content: bytes | str,
     *,
     create_parent_dirs: bool = False,
@@ -460,8 +461,9 @@ def declare_file(
     first creating a directory target.
 
     Args:
-        path: The filesystem path for the file. Can be a FilePath (with stable
-            base directory key) or a pathlib.Path (uses CWD as base directory).
+        path: The filesystem path for the file. Can be a FilePath, a
+            pathlib.Path (uses CWD as base directory), or a ContextKey[Path]
+            (equivalent to FilePath(base_dir=path)).
         content: The content of the file (bytes or str).
         create_parent_dirs: If True, create parent directories if they don't exist.
             Defaults to False.

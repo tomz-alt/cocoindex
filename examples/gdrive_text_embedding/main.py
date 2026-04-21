@@ -20,7 +20,6 @@ import asyncpg
 from numpy.typing import NDArray
 
 import cocoindex as coco
-import cocoindex.asyncio as coco_aio
 from cocoindex.connectors import google_drive, postgres
 from cocoindex.ops.sentence_transformers import SentenceTransformerEmbedder
 from cocoindex.ops.text import RecursiveSplitter
@@ -36,24 +35,23 @@ PG_SCHEMA_NAME = "coco_examples_v1"
 TOP_K = 5
 
 
-@dataclass
-class _GlobalState:
-    pool: asyncpg.Pool | None = None
-    db: postgres.PgDatabase | None = None
+EMBED_MODEL = "sentence-transformers/all-MiniLM-L6-v2"
+PG_DB = coco.ContextKey[asyncpg.Pool]("gdrive_text_embedding_db")
+EMBEDDER = coco.ContextKey[SentenceTransformerEmbedder]("embedder", detect_change=True)
 
-
-_state = _GlobalState()
-_embedder = SentenceTransformerEmbedder("sentence-transformers/all-MiniLM-L6-v2")
+_pool: asyncpg.Pool | None = None
 _splitter = RecursiveSplitter()
 
 
-@coco_aio.lifespan
+@coco.lifespan
 async def coco_lifespan(
-    builder: coco_aio.EnvironmentBuilder,
+    builder: coco.EnvironmentBuilder,
 ) -> AsyncIterator[None]:
-    async with await postgres.create_pool(DATABASE_URL) as pool:
-        _state.pool = pool
-        _state.db = postgres.register_db("gdrive_text_embedding_db", pool)
+    global _pool
+    async with await asyncpg.create_pool(DATABASE_URL) as pool:
+        _pool = pool
+        builder.provide(PG_DB, pool)
+        builder.provide(EMBEDDER, SentenceTransformerEmbedder(EMBED_MODEL))
         yield
 
 
@@ -62,25 +60,23 @@ class DocEmbedding:
     id: int
     filename: str
     text: str
-    embedding: Annotated[NDArray, _embedder]
+    embedding: Annotated[NDArray, EMBEDDER]
 
 
-@coco.function(memo=True)
+@coco.fn(memo=True)
 async def process_file(
     file: google_drive.DriveFile,
     table: postgres.TableTarget[DocEmbedding],
 ) -> None:
-    text = file.read_text()
+    text = await file.read_text()
     chunks = _splitter.split(
         text, chunk_size=2000, chunk_overlap=500, language="markdown"
     )
     id_gen = IdGenerator()
-    await coco_aio.map(
-        _emit_chunk, chunks, file.file_path.path.as_posix(), id_gen, table
-    )
+    await coco.map(_emit_chunk, chunks, file.file_path.path.as_posix(), id_gen, table)
 
 
-@coco.function
+@coco.fn
 async def _emit_chunk(
     chunk: Chunk,
     filename: str,
@@ -92,16 +88,15 @@ async def _emit_chunk(
             id=await id_gen.next_id(chunk.text),
             filename=filename,
             text=chunk.text,
-            embedding=await _embedder.embed(chunk.text),
+            embedding=await coco.use_context(EMBEDDER).embed(chunk.text),
         ),
     )
 
 
-@coco.function
+@coco.fn
 async def app_main() -> None:
-    assert _state.db is not None
-
-    table = await _state.db.mount_table_target(
+    table = await postgres.mount_table_target(
+        PG_DB,
         table_name=TABLE_NAME,
         table_schema=await postgres.TableSchema.from_class(
             DocEmbedding,
@@ -122,18 +117,20 @@ async def app_main() -> None:
         root_folder_ids=root_folder_ids,
     )
 
-    await coco_aio.mount_each(process_file, source.items(), table)
+    await coco.mount_each(process_file, source.items(), table)
 
 
-app = coco_aio.App(
-    coco_aio.AppConfig(name="GoogleDriveTextEmbeddingV1"),
+app = coco.App(
+    coco.AppConfig(name="GoogleDriveTextEmbeddingV1"),
     app_main,
 )
 
 
-async def query_once(query: str, *, top_k: int = TOP_K) -> None:
-    query_vec = await _embedder.embed(query)
-    pool = _state.pool
+async def query_once(
+    embedder: SentenceTransformerEmbedder, query: str, *, top_k: int = TOP_K
+) -> None:
+    query_vec = await embedder.embed(query)
+    pool = _pool
     assert pool is not None
 
     async with pool.acquire() as conn:
@@ -159,17 +156,18 @@ async def query_once(query: str, *, top_k: int = TOP_K) -> None:
 
 
 async def query() -> None:
-    async with coco_aio.runtime():
+    embedder = SentenceTransformerEmbedder(EMBED_MODEL)
+    async with coco.runtime():
         if len(sys.argv) > 2:
             q = " ".join(sys.argv[2:])
-            await query_once(q)
+            await query_once(embedder, q)
             return
 
         while True:
             q = input("Enter search query (or Enter to quit): ").strip()
             if not q:
                 break
-            await query_once(q)
+            await query_once(embedder, q)
 
 
 if __name__ == "__main__":

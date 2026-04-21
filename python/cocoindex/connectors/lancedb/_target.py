@@ -30,14 +30,12 @@ except ImportError as e:
         "lancedb and pyarrow are required to use the LanceDB connector. Please install cocoindex[lancedb]."
     ) from e
 
-# Type alias for lancedb async connection
-# The actual type is internal to lancedb; we use Any for compatibility
-LanceAsyncConnection = Any
+from lancedb.db import AsyncConnection as LanceAsyncConnection  # type: ignore
 
 import numpy as np
 
 import cocoindex as coco
-from cocoindex.connectorkits import connection, statediff
+from cocoindex.connectorkits import statediff, target
 from cocoindex.connectorkits.fingerprint import fingerprint_object
 from cocoindex._internal.datatype import (
     AnyType,
@@ -49,8 +47,10 @@ from cocoindex._internal.datatype import (
     analyze_type_info,
     is_record_type,
 )
-from cocoindex._internal.api_async import mount_target as _mount_target
-from cocoindex.resources.schema import VectorSchemaProvider
+from cocoindex.resources import schema as res_schema
+import msgspec
+
+from cocoindex._internal.context_keys import ContextKey, ContextProvider
 
 # Type aliases
 _RowKey = tuple[Any, ...]  # Primary key values as tuple
@@ -132,7 +132,7 @@ _JSON_MAPPING = _TypeMapping(pa.string(), _json_encoder)
 
 
 async def _get_type_mapping(
-    python_type: Any, *, vector_schema_provider: VectorSchemaProvider | None = None
+    python_type: Any, *, vector_schema: res_schema.VectorSchema | None = None
 ) -> _TypeMapping:
     """
     Get the PyArrow type mapping for a Python type.
@@ -155,9 +155,8 @@ async def _get_type_mapping(
 
     # NumPy ndarray: map to fixed-size list; dimension is handled at the schema layer
     if base_type is np.ndarray:
-        if vector_schema_provider is None:
+        if vector_schema is None:
             raise ValueError("VectorSchemaProvider is required for NumPy ndarray type.")
-        vector_schema = await vector_schema_provider.__coco_vector_schema__()
 
         if vector_schema.size <= 0:
             raise ValueError(f"Invalid vector dimension: {vector_schema.size}")
@@ -171,7 +170,7 @@ async def _get_type_mapping(
         # Create fixed-size list type for vector
         return _TypeMapping(pa.list_(pa_elem, list_size=vector_schema.size))
 
-    elif vector_schema_provider is not None:
+    elif vector_schema is not None:
         raise ValueError(
             f"VectorSchemaProvider is only supported for NumPy ndarray type. Got type: {python_type}"
         )
@@ -243,7 +242,8 @@ class TableSchema(Generic[RowT]):
         record_type: type[RowT],
         primary_key: list[str],
         *,
-        column_specs: dict[str, LanceType | VectorSchemaProvider] | None = None,
+        column_specs: dict[str, LanceType | res_schema.VectorSchemaProvider]
+        | None = None,
     ) -> "TableSchema[RowT]":
         """
         Create a TableSchema from a record type (dataclass, NamedTuple, or Pydantic model).
@@ -267,7 +267,7 @@ class TableSchema(Generic[RowT]):
     @staticmethod
     async def _columns_from_record_type(
         record_type: type,
-        column_specs: dict[str, LanceType | VectorSchemaProvider] | None,
+        column_specs: dict[str, LanceType | res_schema.VectorSchemaProvider] | None,
     ) -> dict[str, ColumnDef]:
         """Convert a record type to a dict of column name -> ColumnDef."""
         record_info = RecordType(record_type)
@@ -277,20 +277,23 @@ class TableSchema(Generic[RowT]):
             spec = column_specs.get(field.name) if column_specs else None
             type_info = analyze_type_info(field.type_hint)
 
-            # Extract LanceType and VectorSchemaProvider from annotations
-            lance_type_annotation: LanceType | None = None
-            vector_schema_provider: VectorSchemaProvider | None = None
-            for annotation in type_info.annotations:
-                if isinstance(annotation, LanceType):
-                    lance_type_annotation = annotation
-                elif isinstance(annotation, VectorSchemaProvider):
-                    vector_schema_provider = annotation
+            all_annotations = []
+            if spec is not None:
+                all_annotations.append(spec)
+            all_annotations.extend(type_info.annotations)
 
-            # Override takes precedence over annotation
-            if isinstance(spec, LanceType):
-                lance_type_annotation = spec
-            elif isinstance(spec, VectorSchemaProvider):
-                vector_schema_provider = spec
+            # Extract LanceType and VectorSchema from annotations
+            lance_type_annotation = next(
+                (t for t in all_annotations if isinstance(t, LanceType)), None
+            )
+            vector_schema = await anext(
+                (
+                    s
+                    for annot in all_annotations
+                    if (s := await res_schema.get_vector_schema(annot)) is not None
+                ),
+                None,
+            )
 
             # Determine type mapping
             if lance_type_annotation is not None:
@@ -299,7 +302,7 @@ class TableSchema(Generic[RowT]):
                 )
             else:
                 type_mapping = await _get_type_mapping(
-                    field.type_hint, vector_schema_provider=vector_schema_provider
+                    field.type_hint, vector_schema=vector_schema
                 )
 
             columns[field.name] = ColumnDef(
@@ -321,23 +324,25 @@ class _RowAction(NamedTuple):
 class _RowHandler(coco.TargetHandler[_RowValue, _RowFingerprint]):
     """Handler for row-level target states within a table."""
 
-    _db_key: str
+    _conn: LanceAsyncConnection
     _table_name: str
     _table_schema: TableSchema
     _sink: coco.TargetActionSink[_RowAction]
 
     def __init__(
         self,
-        db_key: str,
+        conn: LanceAsyncConnection,
         table_name: str,
         table_schema: TableSchema,
     ) -> None:
-        self._db_key = db_key
+        self._conn = conn
         self._table_name = table_name
         self._table_schema = table_schema
         self._sink = coco.TargetActionSink.from_async_fn(self._apply_actions)
 
-    async def _apply_actions(self, actions: Sequence[_RowAction]) -> None:
+    async def _apply_actions(
+        self, context_provider: ContextProvider, actions: Sequence[_RowAction]
+    ) -> None:
         """Apply row actions (upserts and deletes) to the database."""
 
         if not actions:
@@ -352,8 +357,7 @@ class _RowHandler(coco.TargetHandler[_RowValue, _RowFingerprint]):
             else:
                 upserts.append(action)
 
-        conn = _db_registry.get(self._db_key)
-        table = await conn.open_table(self._table_name)
+        table = await self._conn.open_table(self._table_name)
 
         # Process upserts
         if upserts:
@@ -439,14 +443,14 @@ class _RowHandler(coco.TargetHandler[_RowValue, _RowFingerprint]):
         self,
         key: coco.StableKey,
         desired_state: _RowValue | coco.NonExistenceType,
-        prev_possible_states: Collection[_RowFingerprint],
+        prev_possible_records: Collection[_RowFingerprint],
         prev_may_be_missing: bool,
         /,
     ) -> coco.TargetReconcileOutput[_RowAction, _RowFingerprint] | None:
         key = _ROW_KEY_CHECKER.check(key)
         if coco.is_non_existence(desired_state):
             # Delete case - only if it might exist
-            if not prev_possible_states and not prev_may_be_missing:
+            if not prev_possible_records and not prev_may_be_missing:
                 return None
             return coco.TargetReconcileOutput(
                 action=_RowAction(key=key, value=None),
@@ -457,7 +461,7 @@ class _RowHandler(coco.TargetHandler[_RowValue, _RowFingerprint]):
         # Upsert case
         target_fp = fingerprint_object(desired_state)
         if not prev_may_be_missing and all(
-            prev == target_fp for prev in prev_possible_states
+            prev == target_fp for prev in prev_possible_records
         ):
             # No change needed
             return None
@@ -484,10 +488,10 @@ class _TableSpec:
     """Specification for a LanceDB table."""
 
     table_schema: TableSchema[Any]
-    managed_by: Literal["system", "user"] = "system"
+    managed_by: target.ManagedBy = target.ManagedBy.SYSTEM
 
 
-class _ColumnState(NamedTuple):
+class _ColumnState(msgspec.Struct, frozen=True, array_like=True):
     """Per-column state used for table-level state tracking."""
 
     name: str
@@ -543,12 +547,6 @@ class _TableAction(NamedTuple):
     sub_actions: dict[str, statediff.DiffAction]
 
 
-# Database registry: maps stable keys to async connections
-_db_registry: connection.ConnectionRegistry[LanceAsyncConnection] = (
-    connection.ConnectionRegistry("cocoindex/lancedb")
-)
-
-
 class _TableHandler(coco.TargetHandler[_TableSpec, _TableTrackingRecord, _RowHandler]):
     """Handler for table-level target states."""
 
@@ -558,7 +556,7 @@ class _TableHandler(coco.TargetHandler[_TableSpec, _TableTrackingRecord, _RowHan
         self._sink = coco.TargetActionSink.from_async_fn(self._apply_actions)
 
     async def _apply_actions(
-        self, actions: Collection[_TableAction]
+        self, context_provider: ContextProvider, actions: Collection[_TableAction]
     ) -> list[coco.ChildTargetDef[_RowHandler] | None]:
         """Apply table actions (DDL) and return child row handlers."""
         actions_list = list(actions)
@@ -572,7 +570,7 @@ class _TableHandler(coco.TargetHandler[_TableSpec, _TableTrackingRecord, _RowHan
             by_key.setdefault(action.key, []).append(i)
 
         for key, idxs in by_key.items():
-            conn = _db_registry.get(key.db_key)
+            conn = context_provider.get(key.db_key, LanceAsyncConnection)
 
             for i in idxs:
                 action = actions_list[i]
@@ -588,7 +586,7 @@ class _TableHandler(coco.TargetHandler[_TableSpec, _TableTrackingRecord, _RowHan
                 spec = action.spec
                 outputs[i] = coco.ChildTargetDef(
                     handler=_RowHandler(
-                        db_key=key.db_key,
+                        conn=conn,
                         table_name=key.table_name,
                         table_schema=spec.table_schema,
                     )
@@ -667,7 +665,7 @@ class _TableHandler(coco.TargetHandler[_TableSpec, _TableTrackingRecord, _RowHan
         self,
         key: coco.StableKey,
         desired_state: _TableSpec | coco.NonExistenceType,
-        prev_possible_states: Collection[_TableTrackingRecord],
+        prev_possible_records: Collection[_TableTrackingRecord],
         prev_may_be_missing: bool,
         /,
     ) -> (
@@ -690,7 +688,7 @@ class _TableHandler(coco.TargetHandler[_TableSpec, _TableTrackingRecord, _RowHan
         resolved = statediff.resolve_system_transition(
             statediff.TrackingRecordTransition(
                 tracking_record,
-                prev_possible_states,
+                prev_possible_records,
                 prev_may_be_missing,
             )
         )
@@ -703,6 +701,15 @@ class _TableHandler(coco.TargetHandler[_TableSpec, _TableTrackingRecord, _RowHan
                 if action is not None:
                     sub_actions[sub_key] = action
 
+        # Determine child invalidation for row-level targets.
+        child_invalidation: Literal["destructive", "lossy"] | None = None
+        if main_action == "replace":
+            # Table is dropped and recreated — all rows are destroyed.
+            child_invalidation = "destructive"
+        elif main_action is None and any(a != "insert" for a in sub_actions.values()):
+            # Schema changes (other than adding new columns) may lose data.
+            child_invalidation = "lossy"
+
         return coco.TargetReconcileOutput(
             action=_TableAction(
                 key=key,
@@ -712,6 +719,7 @@ class _TableHandler(coco.TargetHandler[_TableSpec, _TableTrackingRecord, _RowHan
             ),
             sink=self._sink,
             tracking_record=tracking_record,
+            child_invalidation=child_invalidation,
         )
 
 
@@ -778,102 +786,87 @@ class TableTarget(
         return self._provider.memo_key
 
 
-class LanceDatabase(connection.KeyedConnection[LanceAsyncConnection]):
+def table_target(
+    db: ContextKey[LanceAsyncConnection],
+    table_name: str,
+    table_schema: TableSchema[RowT],
+    *,
+    managed_by: target.ManagedBy = target.ManagedBy.SYSTEM,
+) -> coco.TargetState[_RowHandler]:
     """
-    Handle for a registered LanceDB database.
+    Create a TargetState for a LanceDB table target.
 
-    Use `register_db()` to create an instance. Can be used as a context manager
-    to automatically unregister on exit.
+    Use with ``coco.mount_target()`` to mount and get a child provider,
+    or with ``mount_table_target()`` for a convenience wrapper.
 
-    Example:
-        ```python
-        # Without context manager (manual lifecycle)
-        db = register_db("my_db", conn)
-        # ... use db ...
+    Args:
+        db: ContextKey for the LanceDB async connection.
+        table_name: Name of the table.
+        table_schema: Schema definition including columns and primary key.
+        managed_by: Whether the table is managed by "system" or "user".
 
-        # With context manager (auto-unregister on exit)
-        with register_db("my_db", conn) as db:
-            # ... use db ...
-        # db is automatically unregistered here
-        ```
+    Returns:
+        A TargetState that can be passed to ``mount_target()``.
     """
+    key = _TableKey(db_key=db.key, table_name=table_name)
+    spec = _TableSpec(
+        table_schema=table_schema,
+        managed_by=managed_by,
+    )
+    return _table_provider.target_state(key, spec)
 
-    def declare_table_target(
-        self,
-        table_name: str,
-        table_schema: TableSchema[RowT],
-        *,
-        managed_by: Literal["system", "user"] = "system",
-    ) -> TableTarget[RowT, coco.PendingS]:
-        """
-        Create a TableTarget for writing rows to a LanceDB table.
 
-        Args:
-            table_name: Name of the table.
-            table_schema: Schema definition including columns and primary key.
-            managed_by: Whether the table is managed by "system" (CocoIndex creates/drops it)
-                        or "user" (table must exist, CocoIndex only manages rows).
+def declare_table_target(
+    db: ContextKey[LanceAsyncConnection],
+    table_name: str,
+    table_schema: TableSchema[RowT],
+    *,
+    managed_by: target.ManagedBy = target.ManagedBy.SYSTEM,
+) -> TableTarget[RowT, coco.PendingS]:
+    """
+    Create a TableTarget for writing rows to a LanceDB table.
 
-        Returns:
-            A TableTarget that can be used to declare rows.
-        """
-        provider = coco.declare_target_state_with_child(
-            self.table_target(table_name, table_schema, managed_by=managed_by)
-        )
-        return TableTarget(provider, table_schema)
+    Args:
+        db: ContextKey for the LanceDB async connection.
+        table_name: Name of the table.
+        table_schema: Schema definition including columns and primary key.
+        managed_by: Whether the table is managed by "system" (CocoIndex creates/drops it)
+                    or "user" (table must exist, CocoIndex only manages rows).
 
-    def table_target(
-        self,
-        table_name: str,
-        table_schema: TableSchema[RowT],
-        *,
-        managed_by: Literal["system", "user"] = "system",
-    ) -> coco.TargetState[_RowHandler]:
-        """
-        Create a TargetState for a LanceDB table target.
+    Returns:
+        A TableTarget that can be used to declare rows.
+    """
+    provider = coco.declare_target_state_with_child(
+        table_target(db, table_name, table_schema, managed_by=managed_by)
+    )
+    return TableTarget(provider, table_schema)
 
-        Use with ``coco_aio.mount_target()`` to mount and get a child provider,
-        or with ``mount_table_target()`` for a convenience wrapper.
 
-        Args:
-            table_name: Name of the table.
-            table_schema: Schema definition including columns and primary key.
-            managed_by: Whether the table is managed by "system" or "user".
+async def mount_table_target(
+    db: ContextKey[LanceAsyncConnection],
+    table_name: str,
+    table_schema: TableSchema[RowT],
+    *,
+    managed_by: target.ManagedBy = target.ManagedBy.SYSTEM,
+) -> TableTarget[RowT]:
+    """
+    Mount a table target and return a ready-to-use TableTarget.
 
-        Returns:
-            A TargetState that can be passed to ``mount_target()``.
-        """
-        key = _TableKey(db_key=self.key, table_name=table_name)
-        spec = _TableSpec(
-            table_schema=table_schema,
-            managed_by=managed_by,
-        )
-        return _table_provider.target_state(key, spec)
+    Sugar over ``table_target()`` + ``coco.mount_target()`` + wrapping.
 
-    async def mount_table_target(
-        self,
-        table_name: str,
-        table_schema: TableSchema[RowT],
-        *,
-        managed_by: Literal["system", "user"] = "system",
-    ) -> TableTarget[RowT]:
-        """
-        Mount a table target and return a ready-to-use TableTarget.
+    Args:
+        db: ContextKey for the LanceDB async connection.
+        table_name: Name of the table.
+        table_schema: Schema definition including columns and primary key.
+        managed_by: Whether the table is managed by "system" or "user".
 
-        Sugar over ``table_target()`` + ``coco_aio.mount_target()`` + wrapping.
-
-        Args:
-            table_name: Name of the table.
-            table_schema: Schema definition including columns and primary key.
-            managed_by: Whether the table is managed by "system" or "user".
-
-        Returns:
-            A TableTarget that can be used to declare rows.
-        """
-        provider = await _mount_target(
-            self.table_target(table_name, table_schema, managed_by=managed_by)
-        )
-        return TableTarget(provider, table_schema)
+    Returns:
+        A TableTarget that can be used to declare rows.
+    """
+    provider = await coco.mount_target(
+        table_target(db, table_name, table_schema, managed_by=managed_by)
+    )
+    return TableTarget(provider, table_schema)
 
 
 async def connect_async(uri: str, **options: Any) -> LanceAsyncConnection:
@@ -918,53 +911,16 @@ def connect(uri: str, **options: Any) -> lancedb.DBConnection:
     return lancedb.connect(uri, **options)
 
 
-def register_db(key: str, conn: LanceAsyncConnection) -> LanceDatabase:
-    """
-    Register a LanceDB async connection with a stable key.
-
-    The key should be stable across runs - it identifies the logical database.
-
-    Can be used as a context manager to automatically unregister on exit.
-
-    Args:
-        key: A stable identifier for this database (e.g., "main_db", "embeddings").
-             Must be unique - raises ValueError if a database with this key
-             is already registered.
-        conn: An async LanceDB connection (from `connect_async()`).
-
-    Returns:
-        A LanceDatabase handle that can be used to create table targets.
-
-    Raises:
-        ValueError: If a database with the given key is already registered.
-
-    Example:
-        ```python
-        async def setup():
-            conn = await lancedb.connect_async("./lancedb_data")
-
-            # Option 1: Manual lifecycle
-            db = register_db("my_db", conn)
-
-            # Option 2: Context manager (auto-unregister on exit)
-            with register_db("my_db", conn) as db:
-                table = db.declare_table_target(scope, "my_table", schema)
-            # db is automatically unregistered here
-        ```
-    """
-    _db_registry.register(key, conn)
-    return LanceDatabase(_db_registry.name, key, conn, _db_registry)
-
-
 __all__ = [
     "ColumnDef",
     "LanceAsyncConnection",
-    "LanceDatabase",
     "LanceType",
     "TableSchema",
     "TableTarget",
     "ValueEncoder",
     "connect",
     "connect_async",
-    "register_db",
+    "declare_table_target",
+    "mount_table_target",
+    "table_target",
 ]

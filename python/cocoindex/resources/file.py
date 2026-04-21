@@ -3,8 +3,7 @@
 from __future__ import annotations
 
 __all__ = [
-    "AsyncFileLike",
-    "BaseDir",
+    "FileMetadata",
     "FileLike",
     "FilePath",
     "FilePathMatcher",
@@ -13,106 +12,119 @@ __all__ = [
 ]
 
 import codecs as _codecs
-from abc import abstractmethod as _abstractmethod
+from abc import ABC as _ABC, abstractmethod as _abstractmethod
 from datetime import datetime as _datetime
 from pathlib import PurePath as _PurePath
 from typing import (
     Generic as _Generic,
+    NamedTuple as _NamedTuple,
     Protocol as _Protocol,
     Self as _Self,
     TypeVar as _TypeVar,
 )
 
 from cocoindex._internal import core as _core
+from cocoindex._internal.context_keys import ContextKey as _ContextKey
+from cocoindex._internal.typing import (
+    MemoStateOutcome as _MemoStateOutcome,
+    NonExistenceType as _NonExistenceType,
+    is_non_existence as _is_non_existence,
+)
 from cocoindex import StableKey as _StableKey
-from cocoindex.connectorkits import connection as _connection
+from cocoindex.connectorkits.fingerprint import fingerprint_bytes as _fingerprint_bytes
 
 # Type variable for the resolved path type (e.g., pathlib.Path for local filesystem)
 ResolvedPathT = _TypeVar("ResolvedPathT")
 
-# Type alias for base directory - a KeyedConnection holding the resolved base path
-BaseDir = _connection.KeyedConnection[ResolvedPathT]
+
+class FileMetadata(_NamedTuple):
+    """Batch metadata for a file.
+
+    Attributes:
+        size: File size in bytes.
+        modified_time: File modification time.
+        content_fingerprint: Optional backend-provided content fingerprint (e.g., S3 ETag).
+            When present, used directly by :meth:`FileLike.content_fingerprint` instead of
+            hashing the full content.
+    """
+
+    size: int
+    modified_time: _datetime
+    content_fingerprint: bytes | None = None
 
 
-class FileLike(_Protocol[ResolvedPathT]):
-    """Protocol for file-like objects with path, size, modified time, and read capability.
+class FileLike(_ABC, _Generic[ResolvedPathT]):
+    """Base class for file-like objects with lazy metadata, content caching, and memoization.
+
+    Subclasses must implement:
+
+    - :meth:`_fetch_metadata` — async batch fetch of size, mtime, and optional fingerprint.
+    - :meth:`_read_impl` — async read of file content from the backend.
+
+    Optionally override :meth:`_compute_content_fingerprint` for backends with native
+    fingerprinting (the default checks metadata, then falls back to hashing content).
 
     Type Parameters:
         ResolvedPathT: The type of the resolved path (e.g., `pathlib.Path` for local filesystem).
     """
 
-    @property
-    def stable_key(self) -> _StableKey:
-        """Return the stable key for this file."""
-        return self.file_path.path.as_posix()
+    _file_path: "FilePath[ResolvedPathT]"
+    _metadata: FileMetadata | None
+    _cached_content: bytes | None
+    _cached_content_fingerprint: bytes | None
+
+    def __init__(
+        self,
+        file_path: "FilePath[ResolvedPathT]",
+        *,
+        _metadata: FileMetadata | None = None,
+    ) -> None:
+        self._file_path = file_path
+        self._metadata = _metadata
+        self._cached_content = None
+        self._cached_content_fingerprint = None
 
     @property
     def file_path(self) -> "FilePath[ResolvedPathT]":
         """Return the FilePath of this file."""
-        ...
+        return self._file_path
 
-    @property
-    def size(self) -> int:
+    # --- Metadata (lazy, cached) ---
+
+    async def _ensure_metadata(self) -> FileMetadata:
+        """Return cached metadata, fetching lazily if needed."""
+        if self._metadata is None:
+            self._metadata = await self._fetch_metadata()
+        return self._metadata
+
+    @_abstractmethod
+    async def _fetch_metadata(self) -> FileMetadata:
+        """Fetch file metadata from the backend.
+
+        Called lazily on first metadata access.  Implementations should batch-fetch
+        all available metadata (size, mtime, content fingerprint if cheap) in one call.
+        """
+
+    async def size(self) -> int:
         """Return the file size in bytes."""
-        ...
+        return (await self._ensure_metadata()).size
 
-    @property
-    def modified_time(self) -> _datetime:
-        """Return the file modification time."""
-        ...
+    # --- Content I/O (cached) ---
 
-    def read(self, size: int = -1) -> bytes:
-        """Read and return the file content as bytes.
+    @_abstractmethod
+    async def _read_impl(self, size: int = -1) -> bytes:
+        """Read file content from the backend.
 
         Args:
             size: Number of bytes to read. If -1 (default), read the entire file.
-
-        Returns:
-            The file content as bytes.
         """
-        ...
-
-    def read_text(self, encoding: str | None = None, errors: str = "replace") -> str:
-        """Read and return the file content as text.
-
-        Args:
-            encoding: The encoding to use. If None, the encoding is detected automatically
-                using BOM detection, falling back to UTF-8.
-            errors: The error handling scheme. Common values: 'strict', 'ignore', 'replace'.
-
-        Returns:
-            The file content as text.
-        """
-        return _decode_bytes(self.read(), encoding, errors)
-
-    def __coco_memo_key__(self) -> object:
-        return (self.file_path.__coco_memo_key__(), self.modified_time)
-
-
-class AsyncFileLike(_Protocol[ResolvedPathT]):
-    """Protocol for async file-like objects with path, size, modified time, and async read.
-
-    Type Parameters:
-        ResolvedPathT: The type of the resolved path (e.g., `pathlib.Path` for local filesystem).
-    """
-
-    @property
-    def file_path(self) -> "FilePath[ResolvedPathT]":
-        """Return the FilePath of this file."""
-        ...
-
-    @property
-    def size(self) -> int:
-        """Return the file size in bytes."""
-        ...
-
-    @property
-    def modified_time(self) -> _datetime:
-        """Return the file modification time."""
-        ...
 
     async def read(self, size: int = -1) -> bytes:
-        """Asynchronously read and return the file content as bytes.
+        """Read and return the file content as bytes.
+
+        Full reads (``size < 0``) are cached: the first call reads from the backend,
+        subsequent calls return the cached content.  Partial reads return from cache
+        if available, otherwise delegate to the backend without caching.
 
         Args:
             size: Number of bytes to read. If -1 (default), read the entire file.
@@ -120,12 +132,18 @@ class AsyncFileLike(_Protocol[ResolvedPathT]):
         Returns:
             The file content as bytes.
         """
-        raise NotImplementedError
+        if size < 0:
+            if self._cached_content is None:
+                self._cached_content = await self._read_impl()
+            return self._cached_content
+        if self._cached_content is not None:
+            return self._cached_content[:size]
+        return await self._read_impl(size)
 
     async def read_text(
         self, encoding: str | None = None, errors: str = "replace"
     ) -> str:
-        """Asynchronously read and return the file content as text.
+        """Read and return the file content as text.
 
         Args:
             encoding: The encoding to use. If None, the encoding is detected automatically
@@ -137,8 +155,51 @@ class AsyncFileLike(_Protocol[ResolvedPathT]):
         """
         return _decode_bytes(await self.read(), encoding, errors)
 
+    # --- Content fingerprinting (cached) ---
+
+    async def _compute_content_fingerprint(self) -> bytes:
+        """Compute a content fingerprint for this file.
+
+        The default checks metadata for a pre-existing fingerprint (e.g., S3 ETag),
+        then falls back to hashing the full content via :func:`fingerprint_bytes`.
+        Override in subclasses for custom fingerprinting.
+        """
+        metadata = await self._ensure_metadata()
+        if metadata.content_fingerprint is not None:
+            return metadata.content_fingerprint
+        return _fingerprint_bytes(await self.read())
+
+    async def content_fingerprint(self) -> bytes:
+        """Return a cached content fingerprint for this file."""
+        if self._cached_content_fingerprint is None:
+            self._cached_content_fingerprint = await self._compute_content_fingerprint()
+        return self._cached_content_fingerprint
+
+    # --- Memoization ---
+
     def __coco_memo_key__(self) -> object:
-        return (self.file_path.__coco_memo_key__(), self.modified_time)
+        return self._file_path.__coco_memo_key__()
+
+    async def __coco_memo_state__(
+        self, prev_state: tuple[_datetime, bytes] | _NonExistenceType
+    ) -> _MemoStateOutcome:
+        metadata = await self._ensure_metadata()
+        current_mtime = metadata.modified_time
+
+        if _is_non_existence(prev_state):
+            fp = await self.content_fingerprint()
+            return _MemoStateOutcome(state=(current_mtime, fp))
+
+        assert isinstance(prev_state, tuple)
+        prev_mtime, prev_fp = prev_state
+        if current_mtime == prev_mtime:
+            return _MemoStateOutcome(state=prev_state, memo_valid=True)
+
+        fp = await self.content_fingerprint()
+        return _MemoStateOutcome(
+            state=(current_mtime, fp),
+            memo_valid=(fp == prev_fp),
+        )
 
 
 class FilePathMatcher(_Protocol):
@@ -156,12 +217,10 @@ class MatchAllFilePathMatcher(FilePathMatcher):
 
     def is_dir_included(self, path: _PurePath) -> bool:  # noqa: ARG002
         """Always returns True - all directories are included."""
-        del path  # unused
         return True
 
     def is_file_included(self, path: _PurePath) -> bool:  # noqa: ARG002
         """Always returns True - all files are included."""
-        del path  # unused
         return True
 
 
@@ -265,19 +324,19 @@ class FilePath(_Generic[ResolvedPathT]):
 
     __slots__ = ("_base_dir", "_path")
 
-    _base_dir: _connection.KeyedConnection[ResolvedPathT]
+    _base_dir: _ContextKey[ResolvedPathT] | None
     _path: _PurePath
 
     def __init__(
         self,
-        base_dir: _connection.KeyedConnection[ResolvedPathT],
+        base_dir: _ContextKey[ResolvedPathT] | None,
         path: _PurePath,
     ) -> None:
         self._base_dir = base_dir
         self._path = path
 
     @property
-    def base_dir(self) -> _connection.KeyedConnection[ResolvedPathT]:
+    def base_dir(self) -> _ContextKey[ResolvedPathT] | None:
         """The base directory for this path."""
         return self._base_dir
 
@@ -385,9 +444,9 @@ class FilePath(_Generic[ResolvedPathT]):
         return str(self._path)
 
     def __repr__(self) -> str:
-        return (
-            f"{type(self).__name__}({self._path!r}, base_dir_key={self.base_dir.key!r})"
-        )
+        if self._base_dir is not None:
+            return f"{type(self).__name__}({self._path!r}, base_dir_key={self._base_dir.key!r})"
+        return f"{type(self).__name__}({self._path!r})"
 
     def __fspath__(self) -> str:
         """Return the file system path as a string for os.fspath() compatibility."""
@@ -395,19 +454,30 @@ class FilePath(_Generic[ResolvedPathT]):
 
     # Comparison and hashing
 
+    def _base_dir_key(self) -> str | None:
+        return self._base_dir.key if self._base_dir is not None else None
+
     def __eq__(self, other: object) -> bool:
         if not isinstance(other, FilePath):
             return NotImplemented
-        return self.base_dir.key == other.base_dir.key and self._path == other._path
+        return (
+            self._base_dir_key() == other._base_dir_key() and self._path == other._path
+        )
 
     def __hash__(self) -> int:
-        return hash((self.base_dir.key, self._path))
+        return hash((self._base_dir_key(), self._path))
 
     def __lt__(self, other: _Self) -> bool:
         if not isinstance(other, FilePath):
             return NotImplemented
-        if self.base_dir.key != other.base_dir.key:
-            return self.base_dir.key < other.base_dir.key
+        sk_self = self._base_dir_key()
+        sk_other = other._base_dir_key()
+        if sk_self != sk_other:
+            if sk_self is None:
+                return True
+            if sk_other is None:
+                return False
+            return sk_self < sk_other
         return self._path < other._path
 
     def __le__(self, other: _Self) -> bool:
@@ -424,4 +494,6 @@ class FilePath(_Generic[ResolvedPathT]):
     # Memoization support
 
     def __coco_memo_key__(self) -> object:
-        return (self.base_dir.__coco_memo_key__(), self._path)
+        if self._base_dir is not None:
+            return (self._base_dir.key, self._path)
+        return self._path

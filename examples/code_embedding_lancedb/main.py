@@ -20,11 +20,10 @@ from typing import AsyncIterator, Annotated
 from numpy.typing import NDArray
 
 import cocoindex as coco
-import cocoindex.asyncio as coco_aio
 from cocoindex.connectors import localfs, lancedb
 from cocoindex.ops.text import RecursiveSplitter, detect_code_language
 from cocoindex.ops.sentence_transformers import SentenceTransformerEmbedder
-from cocoindex.resources.file import AsyncFileLike, PatternFilePathMatcher
+from cocoindex.resources.file import FileLike, PatternFilePathMatcher
 from cocoindex.resources.chunk import Chunk
 from cocoindex.resources.id import IdGenerator
 
@@ -34,9 +33,10 @@ TABLE_NAME = "code_embeddings"
 TOP_K = 5
 
 
-LANCE_DB = coco.ContextKey[lancedb.LanceDatabase]("lance_db")
+EMBED_MODEL = "sentence-transformers/all-MiniLM-L6-v2"
+LANCE_DB = coco.ContextKey[lancedb.LanceAsyncConnection]("code_embedding_db")
+EMBEDDER = coco.ContextKey[SentenceTransformerEmbedder]("embedder", detect_change=True)
 
-_embedder = SentenceTransformerEmbedder("sentence-transformers/all-MiniLM-L6-v2")
 _splitter = RecursiveSplitter()
 
 
@@ -45,22 +45,23 @@ class CodeEmbedding:
     id: int
     filename: str
     code: str
-    embedding: Annotated[NDArray, _embedder]
+    embedding: Annotated[NDArray, EMBEDDER]
     start_line: int
     end_line: int
 
 
-@coco_aio.lifespan
+@coco.lifespan
 async def coco_lifespan(
-    builder: coco_aio.EnvironmentBuilder,
+    builder: coco.EnvironmentBuilder,
 ) -> AsyncIterator[None]:
     # Provide resources needed across the CocoIndex environment
     conn = await lancedb.connect_async(LANCEDB_URI)
-    builder.provide(LANCE_DB, lancedb.register_db("code_embedding_db", conn))
+    builder.provide(LANCE_DB, conn)
+    builder.provide(EMBEDDER, SentenceTransformerEmbedder(EMBED_MODEL))
     yield
 
 
-@coco.function
+@coco.fn
 async def process_chunk(
     chunk: Chunk,
     filename: pathlib.PurePath,
@@ -72,16 +73,16 @@ async def process_chunk(
             id=await id_gen.next_id(chunk.text),
             filename=str(filename),
             code=chunk.text,
-            embedding=await _embedder.embed(chunk.text),
+            embedding=await coco.use_context(EMBEDDER).embed(chunk.text),
             start_line=chunk.start.line,
             end_line=chunk.end.line,
         ),
     )
 
 
-@coco.function(memo=True)
+@coco.fn(memo=True)
 async def process_file(
-    file: AsyncFileLike,
+    file: FileLike,
     table: lancedb.TableTarget[CodeEmbedding],
 ) -> None:
     text = await file.read_text()
@@ -97,13 +98,13 @@ async def process_file(
         language=language,
     )
     id_gen = IdGenerator()
-    await coco_aio.map(process_chunk, chunks, file.file_path.path, id_gen, table)
+    await coco.map(process_chunk, chunks, file.file_path.path, id_gen, table)
 
 
-@coco.function
+@coco.fn
 async def app_main(sourcedir: pathlib.Path) -> None:
-    target_db = coco.use_context(LANCE_DB)
-    target_table = await target_db.mount_table_target(
+    target_table = await lancedb.mount_table_target(
+        LANCE_DB,
         table_name=TABLE_NAME,
         table_schema=await lancedb.TableSchema.from_class(
             CodeEmbedding, primary_key=["id"]
@@ -125,11 +126,11 @@ async def app_main(sourcedir: pathlib.Path) -> None:
             excluded_patterns=["**/.*", "**/target", "**/node_modules"],
         ),
     )
-    await coco_aio.mount_each(process_file, files.items(), target_table)
+    await coco.mount_each(process_file, files.items(), target_table)
 
 
-app = coco_aio.App(
-    coco_aio.AppConfig(name="CodeEmbeddingLanceDBV1"),
+app = coco.App(
+    coco.AppConfig(name="CodeEmbeddingLanceDBV1"),
     app_main,
     sourcedir=pathlib.Path(__file__).parent / ".." / "..",  # Index from repository root
 )
@@ -141,9 +142,13 @@ app = coco_aio.App(
 
 
 async def query_once(
-    conn: lancedb.LanceAsyncConnection, query_text: str, *, top_k: int = TOP_K
+    conn: lancedb.LanceAsyncConnection,
+    embedder: SentenceTransformerEmbedder,
+    query_text: str,
+    *,
+    top_k: int = TOP_K,
 ) -> None:
-    query_vec = await _embedder.embed(query_text)
+    query_vec = await embedder.embed(query_text)
 
     table = await conn.open_table(TABLE_NAME)
 
@@ -161,18 +166,19 @@ async def query_once(
 
 
 async def query() -> None:
+    embedder = SentenceTransformerEmbedder(EMBED_MODEL)
     conn = await lancedb.connect_async(LANCEDB_URI)
 
     if len(sys.argv) > 2:
         q = " ".join(sys.argv[2:])
-        await query_once(conn, q)
+        await query_once(conn, embedder, q)
         return
 
     while True:
         q = input("Enter search query (or Enter to quit): ").strip()
         if not q:
             break
-        await query_once(conn, q)
+        await query_once(conn, embedder, q)
 
 
 if __name__ == "__main__":

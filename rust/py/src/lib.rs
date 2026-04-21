@@ -6,8 +6,9 @@ mod environment;
 mod fingerprint;
 mod function;
 mod inspect;
+pub mod live_component;
 mod logic_registry;
-mod memo_key;
+mod memo_fingerprint;
 mod ops;
 mod prelude;
 mod profile;
@@ -25,20 +26,27 @@ fn core_module(m: &pyo3::Bound<'_, pyo3::types::PyModule>) -> pyo3::PyResult<()>
     m.add("__version__", env!("CARGO_PKG_VERSION"))?;
 
     m.add_function(wrap_pyfunction!(runtime::init_runtime, m)?)?;
+    m.add_function(wrap_pyfunction!(runtime::shutdown_tokio_runtime, m)?)?;
+    m.add_function(wrap_pyfunction!(runtime::py_cancel_all, m)?)?;
+    m.add_function(wrap_pyfunction!(runtime::py_reset_global_cancellation, m)?)?;
 
     m.add_class::<app::PyApp>()?;
+    m.add_class::<app::PyUpdateHandle>()?;
+    m.add_class::<app::PyDropHandle>()?;
+    m.add_function(wrap_pyfunction!(app::show_progress, m)?)?;
 
     m.add_class::<component::PyComponentProcessorInfo>()?;
     m.add_class::<component::PyComponentProcessor>()?;
     m.add_class::<component::PyComponentMountHandle>()?;
     m.add_class::<component::PyComponentMountRunHandle>()?;
-    m.add_function(wrap_pyfunction!(component::mount, m)?)?;
-    m.add_function(wrap_pyfunction!(component::mount_run, m)?)?;
     m.add_function(wrap_pyfunction!(component::mount_async, m)?)?;
-    m.add_function(wrap_pyfunction!(component::mount_run_async, m)?)?;
+    m.add_function(wrap_pyfunction!(component::use_mount_async, m)?)?;
 
     m.add_class::<context::PyComponentProcessorContext>()?;
     m.add_class::<context::PyFnCallContext>()?;
+
+    m.add_class::<live_component::PyLiveComponentController>()?;
+    m.add_function(wrap_pyfunction!(live_component::mount_live_async, m)?)?;
 
     m.add_class::<target_state::PyTargetActionSink>()?;
     m.add_class::<target_state::PyTargetHandler>()?;
@@ -57,6 +65,7 @@ fn core_module(m: &pyo3::Bound<'_, pyo3::types::PyModule>) -> pyo3::PyResult<()>
 
     m.add_function(wrap_pyfunction!(inspect::list_stable_paths, m)?)?;
     m.add_function(wrap_pyfunction!(inspect::iter_stable_paths, m)?)?;
+    m.add_function(wrap_pyfunction!(inspect::iter_stable_paths_by_name, m)?)?;
     m.add_function(wrap_pyfunction!(inspect::list_app_names, m)?)?;
 
     m.add_class::<inspect::PyStablePathNodeType>()?;
@@ -72,14 +81,17 @@ fn core_module(m: &pyo3::Bound<'_, pyo3::types::PyModule>) -> pyo3::PyResult<()>
     m.add_class::<fingerprint::PyFingerprint>()?;
 
     // Function memoization
-    m.add_class::<function::PyPendingFnCallMemo>()?;
+    m.add_class::<function::PyFnCallMemoGuard>()?;
     m.add_function(wrap_pyfunction!(function::reserve_memoization, m)?)?;
     m.add_function(wrap_pyfunction!(function::reserve_memoization_async, m)?)?;
 
     // Memoization fingerprinting (deterministic)
-    m.add_function(wrap_pyfunction!(memo_key::fingerprint_simple_object, m)?)?;
-    m.add_function(wrap_pyfunction!(memo_key::fingerprint_bytes, m)?)?;
-    m.add_function(wrap_pyfunction!(memo_key::fingerprint_str, m)?)?;
+    m.add_function(wrap_pyfunction!(
+        memo_fingerprint::fingerprint_simple_object,
+        m
+    )?)?;
+    m.add_function(wrap_pyfunction!(memo_fingerprint::fingerprint_bytes, m)?)?;
+    m.add_function(wrap_pyfunction!(memo_fingerprint::fingerprint_str, m)?)?;
 
     // Logic change detection
     m.add_function(wrap_pyfunction!(
@@ -103,6 +115,9 @@ fn core_module(m: &pyo3::Bound<'_, pyo3::types::PyModule>) -> pyo3::PyResult<()>
     m.add_class::<rwlock::RWLock>()?;
     m.add_class::<rwlock::RWLockReadGuard>()?;
     m.add_class::<rwlock::RWLockWriteGuard>()?;
+
+    // PyStoredValue (self-caching deserialization wrapper)
+    m.add_class::<value::PyStoredValue>()?;
 
     // Batching infrastructure
     m.add_class::<batching::PyBatchingOptions>()?;

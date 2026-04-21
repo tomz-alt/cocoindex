@@ -20,12 +20,11 @@ from qdrant_client import QdrantClient
 from qdrant_client.http import models as qdrant_models
 
 import cocoindex as coco
-import cocoindex.asyncio as coco_aio
 from cocoindex.connectors import localfs, qdrant
 from cocoindex.ops.text import RecursiveSplitter
 from cocoindex.ops.sentence_transformers import SentenceTransformerEmbedder
 from cocoindex.resources.chunk import Chunk
-from cocoindex.resources.file import AsyncFileLike, PatternFilePathMatcher
+from cocoindex.resources.file import FileLike, PatternFilePathMatcher
 
 
 QDRANT_URL = "http://localhost:6334"
@@ -33,30 +32,32 @@ QDRANT_COLLECTION = "TextEmbedding"
 TOP_K = 5
 
 
-QDRANT_DB = coco.ContextKey[qdrant.QdrantDatabase]("qdrant_db")
+EMBED_MODEL = "sentence-transformers/all-MiniLM-L6-v2"
+QDRANT_DB = coco.ContextKey[QdrantClient]("text_embedding_qdrant")
+EMBEDDER = coco.ContextKey[SentenceTransformerEmbedder]("embedder", detect_change=True)
 
-_embedder = SentenceTransformerEmbedder("sentence-transformers/all-MiniLM-L6-v2")
 _splitter = RecursiveSplitter()
 
 
-@coco_aio.lifespan
+@coco.lifespan
 async def coco_lifespan(
-    builder: coco_aio.EnvironmentBuilder,
+    builder: coco.EnvironmentBuilder,
 ) -> AsyncIterator[None]:
     # Provide resources needed across the CocoIndex environment
     client = qdrant.create_client(QDRANT_URL, prefer_grpc=True)
-    builder.provide(QDRANT_DB, qdrant.register_db("text_embedding_qdrant", client))
+    builder.provide(QDRANT_DB, client)
+    builder.provide(EMBEDDER, SentenceTransformerEmbedder(EMBED_MODEL))
     yield
 
 
-@coco.function
+@coco.fn
 async def process_chunk(
     chunk: Chunk,
     filename: pathlib.PurePath,
     id_gen: IdGenerator,
     target: qdrant.CollectionTarget,
 ) -> None:
-    embedding_vec = await _embedder.embed(chunk.text)
+    embedding_vec = await coco.use_context(EMBEDDER).embed(chunk.text)
 
     point = qdrant.PointStruct(
         id=await id_gen.next_id(chunk.text),
@@ -71,9 +72,9 @@ async def process_chunk(
     target.declare_point(point)
 
 
-@coco.function(memo=True)
+@coco.fn(memo=True)
 async def process_file(
-    file: AsyncFileLike,
+    file: FileLike,
     target: qdrant.CollectionTarget,
 ) -> None:
     text = await file.read_text()
@@ -81,16 +82,16 @@ async def process_file(
         text, chunk_size=2000, chunk_overlap=500, language="markdown"
     )
     id_gen = IdGenerator()
-    await coco_aio.map(process_chunk, chunks, file.file_path.path, id_gen, target)
+    await coco.map(process_chunk, chunks, file.file_path.path, id_gen, target)
 
 
-@coco.function
+@coco.fn
 async def app_main(sourcedir: pathlib.Path) -> None:
-    target_db = coco.use_context(QDRANT_DB)
-    target_collection = await target_db.mount_collection_target(
+    target_collection = await qdrant.mount_collection_target(
+        QDRANT_DB,
         collection_name=QDRANT_COLLECTION,
         schema=await qdrant.CollectionSchema.create(
-            vectors=qdrant.QdrantVectorDef(schema=_embedder)
+            vectors=qdrant.QdrantVectorDef(schema=EMBEDDER)
         ),
     )
     files = localfs.walk_dir(
@@ -98,11 +99,11 @@ async def app_main(sourcedir: pathlib.Path) -> None:
         recursive=True,
         path_matcher=PatternFilePathMatcher(included_patterns=["**/*.md"]),
     )
-    await coco_aio.mount_each(process_file, files.items(), target_collection)
+    await coco.mount_each(process_file, files.items(), target_collection)
 
 
-app = coco_aio.App(
-    coco_aio.AppConfig(name="TextEmbeddingQdrantV1"),
+app = coco.App(
+    coco.AppConfig(name="TextEmbeddingQdrantV1"),
     app_main,
     sourcedir=pathlib.Path("./markdown_files"),
 )
@@ -113,8 +114,14 @@ app = coco_aio.App(
 # ============================================================================
 
 
-async def query_once(client: QdrantClient, query: str, *, top_k: int = TOP_K) -> None:
-    query_vec = await _embedder.embed(query)
+async def query_once(
+    client: QdrantClient,
+    embedder: SentenceTransformerEmbedder,
+    query: str,
+    *,
+    top_k: int = TOP_K,
+) -> None:
+    query_vec = await embedder.embed(query)
     results = _qdrant_search(client, QDRANT_COLLECTION, query_vec.tolist(), top_k)
 
     for r in results:
@@ -125,17 +132,18 @@ async def query_once(client: QdrantClient, query: str, *, top_k: int = TOP_K) ->
 
 
 async def query() -> None:
+    embedder = SentenceTransformerEmbedder(EMBED_MODEL)
     client = qdrant.create_client(QDRANT_URL, prefer_grpc=True)
     if len(sys.argv) > 1:
         q = " ".join(sys.argv[1:])
-        await query_once(client, q)
+        await query_once(client, embedder, q)
         return
 
     while True:
         q = input("Enter search query (or Enter to quit): ").strip()
         if not q:
             break
-        await query_once(client, q)
+        await query_once(client, embedder, q)
 
 
 def _qdrant_search(

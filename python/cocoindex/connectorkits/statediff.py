@@ -40,6 +40,8 @@ from typing import (
 )
 from typing_extensions import TypeVar as _TypeVar
 
+import msgspec as _msgspec
+
 import cocoindex as _coco
 
 _TrackingRecordT = _TypeVar("_TrackingRecordT")
@@ -51,7 +53,10 @@ DiffAction = _Literal["insert", "upsert", "replace", "delete"]
 
 
 class CompositeTrackingRecord(
-    _Generic[_MainTrackingRecordT, _SubKeyT, _SubTrackingRecordT], _NamedTuple
+    _msgspec.Struct,
+    _Generic[_MainTrackingRecordT, _SubKeyT, _SubTrackingRecordT],
+    frozen=True,
+    array_like=True,
 ):
     """A state with a main component and a set of keyed sub-states.
 
@@ -90,10 +95,12 @@ class TrackingRecordTransition(_Generic[_TrackingRecordT], _NamedTuple):
     prev_may_be_missing: bool
 
 
-ManagedBy = _Literal["system", "user"]
+from cocoindex.connectorkits.target import ManagedBy as ManagedBy
 
 
-class MutualTrackingRecord(_Generic[_TrackingRecordT], _NamedTuple):
+class MutualTrackingRecord(
+    _msgspec.Struct, _Generic[_TrackingRecordT], frozen=True, array_like=True
+):
     """A tracking record tagged with ownership/management information.
 
     This is useful when a resource can be managed by either the system

@@ -25,11 +25,10 @@ import asyncpg
 from numpy.typing import NDArray
 
 import cocoindex as coco
-import cocoindex.asyncio as coco_aio
 from cocoindex.connectors import localfs, postgres
 from cocoindex.ops.text import RecursiveSplitter
 from cocoindex.ops.sentence_transformers import SentenceTransformerEmbedder
-from cocoindex.resources.file import AsyncFileLike, PatternFilePathMatcher
+from cocoindex.resources.file import FileLike, PatternFilePathMatcher
 from cocoindex.resources.id import IdGenerator
 
 from models import ChunkInput, SessionInfo, TranscriptChunk
@@ -47,9 +46,10 @@ TABLE_METADATA = os.getenv("TABLE_METADATA", "session_metadata")
 PG_SCHEMA_NAME = os.getenv("PG_SCHEMA_NAME", "entire")
 TOP_K = 5
 
-PG_DB = coco.ContextKey[postgres.PgDatabase]("pg_db")
+EMBED_MODEL = "sentence-transformers/all-MiniLM-L6-v2"
+PG_DB = coco.ContextKey[asyncpg.Pool]("entire_session_db")
+EMBEDDER = coco.ContextKey[SentenceTransformerEmbedder]("embedder", detect_change=True)
 
-_embedder = SentenceTransformerEmbedder("sentence-transformers/all-MiniLM-L6-v2")
 _splitter = RecursiveSplitter()
 
 
@@ -58,12 +58,13 @@ _splitter = RecursiveSplitter()
 # ---------------------------------------------------------------------------
 
 
-@coco_aio.lifespan
+@coco.lifespan
 async def coco_lifespan(
-    builder: coco_aio.EnvironmentBuilder,
+    builder: coco.EnvironmentBuilder,
 ) -> AsyncIterator[None]:
-    async with await postgres.create_pool(DATABASE_URL) as pool:
-        builder.provide(PG_DB, postgres.register_db("entire_session_db", pool))
+    async with await asyncpg.create_pool(DATABASE_URL) as pool:
+        builder.provide(PG_DB, pool)
+        builder.provide(EMBEDDER, SentenceTransformerEmbedder(EMBED_MODEL))
         yield
 
 
@@ -80,7 +81,7 @@ class SessionEmbeddingRow:
     content_type: str  # "transcript", "prompt", or "context"
     role: str  # "user", "assistant", or "" for non-transcript
     text: str
-    embedding: Annotated[NDArray, _embedder]
+    embedding: Annotated[NDArray, EMBEDDER]
 
 
 @dataclass
@@ -98,7 +99,7 @@ class SessionMetadataRow:
 # ---------------------------------------------------------------------------
 
 
-def extract_session_info(file: AsyncFileLike) -> SessionInfo:
+def extract_session_info(file: FileLike) -> SessionInfo:
     """Extract checkpoint_id and session_index from file path.
 
     Entire layout: <checkpoint_id[:2]>/<checkpoint_id[2:]>/<session_idx>/<filename>
@@ -153,7 +154,7 @@ def parse_transcript(content: str) -> list[TranscriptChunk]:
 # ---------------------------------------------------------------------------
 
 
-@coco.function
+@coco.fn
 async def process_chunk(
     chunk: ChunkInput,
     info: SessionInfo,
@@ -168,14 +169,14 @@ async def process_chunk(
             content_type=chunk.content_type,
             role=chunk.role,
             text=chunk.text,
-            embedding=await _embedder.embed(chunk.text),
+            embedding=await coco.use_context(EMBEDDER).embed(chunk.text),
         ),
     )
 
 
-@coco.function(memo=True)
+@coco.fn(memo=True)
 async def process_file(
-    file: AsyncFileLike,
+    file: FileLike,
     emb_table: postgres.TableTarget[SessionEmbeddingRow],
     meta_table: postgres.TableTarget[SessionMetadataRow],
 ) -> None:
@@ -186,7 +187,7 @@ async def process_file(
     if filename == "full.jsonl":
         content = await file.read_text()
         chunks = parse_transcript(content)
-        await coco_aio.map(
+        await coco.map(
             process_chunk,
             [
                 ChunkInput(text=c.text, content_type="transcript", role=c.role)
@@ -208,7 +209,7 @@ async def process_file(
                     content_type="prompt",
                     role="user",
                     text=text,
-                    embedding=await _embedder.embed(text),
+                    embedding=await coco.use_context(EMBEDDER).embed(text),
                 ),
             )
 
@@ -218,7 +219,7 @@ async def process_file(
             chunks = _splitter.split(
                 text, chunk_size=2000, chunk_overlap=500, language="markdown"
             )
-            await coco_aio.map(
+            await coco.map(
                 process_chunk,
                 [
                     ChunkInput(text=c.text, content_type="context", role="")
@@ -273,11 +274,10 @@ async def process_file(
 # ---------------------------------------------------------------------------
 
 
-@coco.function
+@coco.fn
 async def app_main(checkpoints_dir: pathlib.Path) -> None:
-    target_db = coco.use_context(PG_DB)
-
-    emb_table = await target_db.mount_table_target(
+    emb_table = await postgres.mount_table_target(
+        PG_DB,
         table_name=TABLE_EMBEDDINGS,
         table_schema=await postgres.TableSchema.from_class(
             SessionEmbeddingRow,
@@ -286,7 +286,8 @@ async def app_main(checkpoints_dir: pathlib.Path) -> None:
         pg_schema_name=PG_SCHEMA_NAME,
     )
 
-    meta_table = await target_db.mount_table_target(
+    meta_table = await postgres.mount_table_target(
+        PG_DB,
         table_name=TABLE_METADATA,
         table_schema=await postgres.TableSchema.from_class(
             SessionMetadataRow,
@@ -308,11 +309,11 @@ async def app_main(checkpoints_dir: pathlib.Path) -> None:
             excluded_patterns=["**/content_hash.txt"],
         ),
     )
-    await coco_aio.mount_each(process_file, files.items(), emb_table, meta_table)
+    await coco.mount_each(process_file, files.items(), emb_table, meta_table)
 
 
-app = coco_aio.App(
-    coco_aio.AppConfig(name="EntireSessionSearch"),
+app = coco.App(
+    coco.AppConfig(name="EntireSessionSearch"),
     app_main,
     checkpoints_dir=pathlib.Path("./entire_checkpoints"),
 )
@@ -323,8 +324,14 @@ app = coco_aio.App(
 # ---------------------------------------------------------------------------
 
 
-async def query_once(pool: asyncpg.Pool, query: str, *, top_k: int = TOP_K) -> None:
-    query_vec = await _embedder.embed(query)
+async def query_once(
+    pool: asyncpg.Pool,
+    embedder: SentenceTransformerEmbedder,
+    query: str,
+    *,
+    top_k: int = TOP_K,
+) -> None:
+    query_vec = await embedder.embed(query)
     async with pool.acquire() as conn:
         rows = await conn.fetch(
             f"""
@@ -354,17 +361,18 @@ async def query_once(pool: asyncpg.Pool, query: str, *, top_k: int = TOP_K) -> N
 
 
 async def query() -> None:
-    async with await postgres.create_pool(DATABASE_URL) as pool:
+    embedder = SentenceTransformerEmbedder(EMBED_MODEL)
+    async with await asyncpg.create_pool(DATABASE_URL) as pool:
         if len(sys.argv) > 1:
             q = " ".join(sys.argv[1:])
-            await query_once(pool, q)
+            await query_once(pool, embedder, q)
             return
 
         while True:
             q = input("Enter search query (or Enter to quit): ").strip()
             if not q:
                 break
-            await query_once(pool, q)
+            await query_once(pool, embedder, q)
 
 
 if __name__ == "__main__":

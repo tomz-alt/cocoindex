@@ -25,7 +25,6 @@ from transformers import CLIPModel, CLIPProcessor
 import numpy as np
 
 import cocoindex as coco
-import cocoindex.asyncio as coco_aio
 from cocoindex.connectors import localfs, qdrant
 from cocoindex.resources.file import FileLike, PatternFilePathMatcher
 from cocoindex.resources.schema import VectorSchema
@@ -36,7 +35,7 @@ CLIP_MODEL_NAME = "openai/clip-vit-large-patch14"
 TOP_K = 5
 
 
-QDRANT_DB = coco.ContextKey[qdrant.QdrantDatabase]("qdrant_db")
+QDRANT_DB = coco.ContextKey[QdrantClient]("image_search_qdrant")
 QDRANT_CLIENT = coco.ContextKey[QdrantClient]("qdrant_client")
 
 
@@ -64,23 +63,23 @@ def embed_image_bytes(img_bytes: bytes) -> list[float]:
     return features[0].tolist()
 
 
-@coco_aio.lifespan
+@coco.lifespan
 async def coco_lifespan(
-    builder: coco_aio.EnvironmentBuilder,
+    builder: coco.EnvironmentBuilder,
 ) -> AsyncIterator[None]:
     # Provide resources needed across the CocoIndex environment
     client = qdrant.create_client(QDRANT_URL, prefer_grpc=True)
-    builder.provide(QDRANT_DB, qdrant.register_db("image_search_qdrant", client))
+    builder.provide(QDRANT_DB, client)
     builder.provide(QDRANT_CLIENT, client)
     yield
 
 
-@coco.function(memo=True)
-def process_file(
+@coco.fn(memo=True)
+async def process_file(
     file: FileLike,
     target: qdrant.CollectionTarget,
 ) -> None:
-    content = file.read()
+    content = await file.read()
     embedding = embed_image_bytes(content)
     row_id = _image_id(file.file_path.path)
     point = qdrant.PointStruct(
@@ -91,13 +90,13 @@ def process_file(
     target.declare_point(point)
 
 
-@coco.function
+@coco.fn
 async def app_main(sourcedir: pathlib.Path) -> None:
     model, _ = get_clip_model()
-    dim = int(model.config.projection_dim)
+    dim: int = model.config.projection_dim  # type: ignore[assignment]
 
-    target_db = coco.use_context(QDRANT_DB)
-    target_collection = await target_db.mount_collection_target(
+    target_collection = await qdrant.mount_collection_target(
+        QDRANT_DB,
         collection_name=QDRANT_COLLECTION,
         schema=await qdrant.CollectionSchema.create(
             vectors=qdrant.QdrantVectorDef(
@@ -114,11 +113,11 @@ async def app_main(sourcedir: pathlib.Path) -> None:
             included_patterns=["**/*.jpg", "**/*.jpeg", "**/*.png"]
         ),
     )
-    await coco_aio.mount_each(process_file, files.items(), target_collection)
+    await coco.mount_each(process_file, files.items(), target_collection)
 
 
-app = coco_aio.App(
-    coco_aio.AppConfig(name="ImageSearchQdrantV1"),
+app = coco.App(
+    coco.AppConfig(name="ImageSearchQdrantV1"),
     app_main,
     sourcedir=pathlib.Path("./img"),
 )

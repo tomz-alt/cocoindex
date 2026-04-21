@@ -28,11 +28,10 @@ from dotenv import load_dotenv
 from pypdf import PdfReader, PdfWriter
 
 import cocoindex as coco
-import cocoindex.asyncio as coco_aio
 from cocoindex.connectors import localfs, postgres
 from cocoindex.ops.text import CustomLanguageConfig, RecursiveSplitter
 from cocoindex.ops.sentence_transformers import SentenceTransformerEmbedder
-from cocoindex.resources.file import AsyncFileLike, PatternFilePathMatcher
+from cocoindex.resources.file import FileLike, PatternFilePathMatcher
 
 from models import AuthorModel, PaperMetadataModel
 
@@ -45,9 +44,9 @@ LLM_MODEL = "gpt-4o"
 TOP_K = 5
 
 
-PG_DB = coco.ContextKey[postgres.PgDatabase]("pg_db")
-
-_embedder = SentenceTransformerEmbedder("sentence-transformers/all-MiniLM-L6-v2")
+EMBED_MODEL = "sentence-transformers/all-MiniLM-L6-v2"
+PG_DB = coco.ContextKey[asyncpg.Pool]("paper_metadata_db")
+EMBEDDER = coco.ContextKey[SentenceTransformerEmbedder]("embedder", detect_change=True)
 
 _abstract_splitter = RecursiveSplitter(
     custom_languages=[
@@ -96,7 +95,7 @@ class MetadataEmbeddingRow:
     filename: str
     location: str
     text: str
-    embedding: Annotated[NDArray, _embedder]
+    embedding: Annotated[NDArray, EMBEDDER]
 
 
 # =========================================================================
@@ -104,7 +103,7 @@ class MetadataEmbeddingRow:
 # =========================================================================
 
 
-@coco.function
+@coco.fn
 def extract_basic_info(content: bytes) -> PaperBasicInfo:
     """Extract first page bytes and page count from a PDF."""
     reader = PdfReader(io.BytesIO(content))
@@ -117,7 +116,7 @@ def extract_basic_info(content: bytes) -> PaperBasicInfo:
     return PaperBasicInfo(num_pages=len(reader.pages), first_page=output.getvalue())
 
 
-@coco.function
+@coco.fn
 def pdf_to_markdown(content: bytes) -> str:
     """Convert PDF bytes to text using pypdf."""
     reader = PdfReader(io.BytesIO(content))
@@ -125,7 +124,7 @@ def pdf_to_markdown(content: bytes) -> str:
     return page_text or ""
 
 
-@coco.function
+@coco.fn
 def extract_metadata(markdown: str) -> PaperMetadataModel:
     """Extract paper metadata from first-page text using an LLM."""
     client = openai_client()
@@ -156,23 +155,24 @@ def extract_metadata(markdown: str) -> PaperMetadataModel:
     return PaperMetadataModel.model_validate_json(content)
 
 
-@coco_aio.lifespan
+@coco.lifespan
 async def coco_lifespan(
-    builder: coco_aio.EnvironmentBuilder,
+    builder: coco.EnvironmentBuilder,
 ) -> AsyncIterator[None]:
     # Provide resources needed across the CocoIndex environment
     database_url = os.getenv("POSTGRES_URL")
     if not database_url:
         raise ValueError("POSTGRES_URL is not set")
 
-    async with await postgres.create_pool(database_url) as pool:
-        builder.provide(PG_DB, postgres.register_db("paper_metadata_db", pool))
+    async with await asyncpg.create_pool(database_url) as pool:
+        builder.provide(PG_DB, pool)
+        builder.provide(EMBEDDER, SentenceTransformerEmbedder(EMBED_MODEL))
         yield
 
 
-@coco.function(memo=True)
+@coco.fn(memo=True)
 async def process_file(
-    file: AsyncFileLike,
+    file: FileLike,
     metadata_table: postgres.TableTarget[PaperMetadataRow],
     author_table: postgres.TableTarget[AuthorPaperRow],
     embedding_table: postgres.TableTarget[MetadataEmbeddingRow],
@@ -204,7 +204,7 @@ async def process_file(
                 ),
             )
 
-    title_embedding = await _embedder.embed(metadata.title)
+    title_embedding = await coco.use_context(EMBEDDER).embed(metadata.title)
     embedding_table.declare_row(
         row=MetadataEmbeddingRow(
             id=uuid.uuid4(),
@@ -229,15 +229,15 @@ async def process_file(
                 filename=str(file.file_path.path),
                 location="abstract",
                 text=chunk.text,
-                embedding=await _embedder.embed(chunk.text),
+                embedding=await coco.use_context(EMBEDDER).embed(chunk.text),
             ),
         )
 
 
-@coco.function
+@coco.fn
 async def app_main(sourcedir: pathlib.Path) -> None:
-    target_db = coco.use_context(PG_DB)
-    metadata_table = await target_db.mount_table_target(
+    metadata_table = await postgres.mount_table_target(
+        PG_DB,
         table_name=TABLE_METADATA,
         table_schema=await postgres.TableSchema.from_class(
             PaperMetadataRow,
@@ -245,7 +245,8 @@ async def app_main(sourcedir: pathlib.Path) -> None:
         ),
         pg_schema_name=PG_SCHEMA_NAME,
     )
-    author_table = await target_db.mount_table_target(
+    author_table = await postgres.mount_table_target(
+        PG_DB,
         table_name=TABLE_AUTHOR_PAPERS,
         table_schema=await postgres.TableSchema.from_class(
             AuthorPaperRow,
@@ -253,7 +254,8 @@ async def app_main(sourcedir: pathlib.Path) -> None:
         ),
         pg_schema_name=PG_SCHEMA_NAME,
     )
-    embedding_table = await target_db.mount_table_target(
+    embedding_table = await postgres.mount_table_target(
+        PG_DB,
         table_name=TABLE_EMBEDDINGS,
         table_schema=await postgres.TableSchema.from_class(
             MetadataEmbeddingRow,
@@ -267,13 +269,13 @@ async def app_main(sourcedir: pathlib.Path) -> None:
         recursive=True,
         path_matcher=PatternFilePathMatcher(included_patterns=["**/*.pdf"]),
     )
-    await coco_aio.mount_each(
+    await coco.mount_each(
         process_file, files.items(), metadata_table, author_table, embedding_table
     )
 
 
-app = coco_aio.App(
-    coco_aio.AppConfig(name="PaperMetadataV1"),
+app = coco.App(
+    coco.AppConfig(name="PaperMetadataV1"),
     app_main,
     sourcedir=pathlib.Path("./papers"),
 )
@@ -284,8 +286,14 @@ app = coco_aio.App(
 # =========================================================================
 
 
-async def query_once(pool: asyncpg.Pool, query: str, *, top_k: int = TOP_K) -> None:
-    query_vec = await _embedder.embed(query)
+async def query_once(
+    pool: asyncpg.Pool,
+    embedder: SentenceTransformerEmbedder,
+    query: str,
+    *,
+    top_k: int = TOP_K,
+) -> None:
+    query_vec = await embedder.embed(query)
     async with pool.acquire() as conn:
         rows = await conn.fetch(
             f"""
@@ -314,17 +322,18 @@ async def query() -> None:
     if not database_url:
         raise ValueError("POSTGRES_URL is not set")
 
-    async with await postgres.create_pool(database_url) as pool:
+    embedder = SentenceTransformerEmbedder(EMBED_MODEL)
+    async with await asyncpg.create_pool(database_url) as pool:
         if len(sys.argv) > 2:
             q = " ".join(sys.argv[2:])
-            await query_once(pool, q)
+            await query_once(pool, embedder, q)
             return
 
         while True:
             q = input("Enter search query (or Enter to quit): ").strip()
             if not q:
                 break
-            await query_once(pool, q)
+            await query_once(pool, embedder, q)
 
 
 load_dotenv()

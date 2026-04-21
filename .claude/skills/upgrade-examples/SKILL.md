@@ -47,4 +47,17 @@ git commit -m "chore: upgrade examples deps to cocoindex-VERSION"
 git push -u origin ex-dep-VERSION
 ```
 
-5. Report the number of files updated and provide the branch name for creating a PR.
+5. Create a PR using the `gh` CLI and capture the PR URL from its output:
+
+```bash
+gh pr create --base v1 --title "chore: upgrade examples deps to cocoindex-VERSION" --body ""
+```
+
+6. Switch back to the previous branch and delete the local branch:
+
+```bash
+git checkout v1
+git branch -d ex-dep-VERSION
+```
+
+7. Report the number of files updated and provide the PR link from the `gh pr create` output to the user.

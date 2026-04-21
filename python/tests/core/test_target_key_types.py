@@ -25,7 +25,9 @@ class AnyKeyDictTargetStateStore:
 
     def _sink(
         self,
+        context_provider: coco.ContextProvider,
         actions: Collection[tuple[Any, DictDataWithPrev | coco.NonExistenceType]],
+        /,
     ) -> None:
         if self.sink_exception:
             raise ValueError("injected sink exception")
@@ -41,15 +43,17 @@ class AnyKeyDictTargetStateStore:
 
     async def _async_sink(
         self,
+        context_provider: coco.ContextProvider,
         actions: Collection[tuple[Any, DictDataWithPrev | coco.NonExistenceType]],
+        /,
     ) -> None:
-        self._sink(actions)
+        self._sink(context_provider, actions)
 
     def reconcile(
         self,
         key: Any,
         desired_state: Any | coco.NonExistenceType,
-        prev_possible_states: Collection[Any],
+        prev_possible_records: Collection[Any],
         prev_may_be_missing: bool,
     ) -> (
         coco.TargetReconcileOutput[
@@ -59,11 +63,11 @@ class AnyKeyDictTargetStateStore:
     ):
         # Short-circuit no-change case
         if coco.is_non_existence(desired_state):
-            if len(prev_possible_states) == 0:
+            if len(prev_possible_records) == 0:
                 return None
         else:
             if not prev_may_be_missing and all(
-                prev == desired_state for prev in prev_possible_states
+                prev == desired_state for prev in prev_possible_records
             ):
                 return None
 
@@ -72,7 +76,7 @@ class AnyKeyDictTargetStateStore:
             if coco.is_non_existence(desired_state)
             else DictDataWithPrev(
                 data=desired_state,
-                prev=prev_possible_states,
+                prev=prev_possible_records,
                 prev_may_be_missing=prev_may_be_missing,
             )
         )
@@ -131,7 +135,7 @@ def test_valid_stable_keys() -> None:
         coco.AppConfig(name="test_valid_stable_keys_run", environment=coco_env),
         declare_keys,
     )
-    app.update()
+    app.update_blocking()
 
     stored_data = AnyKeyTarget.store.data
 
@@ -150,7 +154,7 @@ def test_valid_stable_keys() -> None:
     app = coco.App(
         coco.AppConfig(name="test_none_key", environment=coco_env), declare_none_key
     )
-    app.update()
+    app.update_blocking()
     assert AnyKeyTarget.store.data[None].data == "none_val"
 
 
@@ -169,7 +173,7 @@ def test_invalid_keys() -> None:
         declare_invalid_key,
     )
     with pytest.raises(TypeError, match="Unsupported StableKey Python type"):
-        app.update()
+        app.update_blocking()
 
 
 def test_nested_container_keys() -> None:
@@ -184,7 +188,7 @@ def test_nested_container_keys() -> None:
     app = coco.App(
         coco.AppConfig(name="test_nested_keys", environment=coco_env), declare_list_key
     )
-    app.update()
+    app.update_blocking()
 
     assert key_expected in AnyKeyTarget.store.data
     assert AnyKeyTarget.store.data[key_expected].data == "val"

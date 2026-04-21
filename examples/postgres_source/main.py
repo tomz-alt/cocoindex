@@ -11,7 +11,6 @@ from __future__ import annotations
 
 import asyncio
 import os
-import pathlib
 import sys
 from dataclasses import dataclass
 from typing import Annotated, AsyncIterator
@@ -20,7 +19,6 @@ import asyncpg
 from numpy.typing import NDArray
 
 import cocoindex as coco
-import cocoindex.asyncio as coco_aio
 from cocoindex.connectors import postgres
 from cocoindex.ops.sentence_transformers import SentenceTransformerEmbedder
 
@@ -34,10 +32,10 @@ PG_SCHEMA_NAME = "coco_examples_v1"
 TOP_K = 5
 
 
-PG_DB = coco.ContextKey[postgres.PgDatabase]("pg_db")
+EMBED_MODEL = "sentence-transformers/all-MiniLM-L6-v2"
+PG_DB = coco.ContextKey[asyncpg.Pool]("postgres_source_db")
 SOURCE_POOL = coco.ContextKey[asyncpg.Pool]("source_pool")
-
-_embedder = SentenceTransformerEmbedder("sentence-transformers/all-MiniLM-L6-v2")
+EMBEDDER = coco.ContextKey[SentenceTransformerEmbedder]("embedder", detect_change=True)
 
 
 @dataclass
@@ -57,31 +55,32 @@ class OutputProduct:
     price: float
     amount: int
     total_value: float
-    embedding: Annotated[NDArray, _embedder]
+    embedding: Annotated[NDArray, EMBEDDER]
 
 
-@coco_aio.lifespan
+@coco.lifespan
 async def coco_lifespan(
-    builder: coco_aio.EnvironmentBuilder,
+    builder: coco.EnvironmentBuilder,
 ) -> AsyncIterator[None]:
     # Provide resources needed across the CocoIndex environment
     async with (
-        await postgres.create_pool(DATABASE_URL) as target_pool,
-        await postgres.create_pool(SOURCE_DATABASE_URL) as source_pool,
+        await asyncpg.create_pool(DATABASE_URL) as target_pool,
+        await asyncpg.create_pool(SOURCE_DATABASE_URL) as source_pool,
     ):
-        builder.provide(PG_DB, postgres.register_db("postgres_source_db", target_pool))
+        builder.provide(PG_DB, target_pool)
         builder.provide(SOURCE_POOL, source_pool)
+        builder.provide(EMBEDDER, SentenceTransformerEmbedder(EMBED_MODEL))
         yield
 
 
-@coco.function(memo=True)
+@coco.fn(memo=True)
 async def process_product(
     product: SourceProduct,
     table: postgres.TableTarget[OutputProduct],
 ) -> None:
     full_description = f"Category: {product.product_category}\nName: {product.product_name}\n\n{product.description}"
     total_value = product.price * product.amount
-    embedding = await _embedder.embed(full_description)
+    embedding = await coco.use_context(EMBEDDER).embed(full_description)
     table.declare_row(
         row=OutputProduct(
             product_category=product.product_category,
@@ -95,10 +94,10 @@ async def process_product(
     )
 
 
-@coco.function
+@coco.fn
 async def app_main() -> None:
-    target_db = coco.use_context(PG_DB)
-    target_table = await target_db.mount_table_target(
+    target_table = await postgres.mount_table_target(
+        PG_DB,
         table_name=TABLE_NAME,
         table_schema=await postgres.TableSchema.from_class(
             OutputProduct,
@@ -113,21 +112,27 @@ async def app_main() -> None:
         row_type=SourceProduct,
     )
 
-    await coco_aio.mount_each(
+    await coco.mount_each(
         process_product,
         source.fetch_rows().items(lambda p: (p.product_category, p.product_name)),
         target_table,
     )
 
 
-app = coco_aio.App(
-    coco_aio.AppConfig(name="PostgresSourceV1"),
+app = coco.App(
+    coco.AppConfig(name="PostgresSourceV1"),
     app_main,
 )
 
 
-async def query_once(pool: asyncpg.Pool, query: str, *, top_k: int = TOP_K) -> None:
-    query_vec = await _embedder.embed(query)
+async def query_once(
+    pool: asyncpg.Pool,
+    embedder: SentenceTransformerEmbedder,
+    query: str,
+    *,
+    top_k: int = TOP_K,
+) -> None:
+    query_vec = await embedder.embed(query)
     async with pool.acquire() as conn:
         rows = await conn.fetch(
             f"""
@@ -156,10 +161,11 @@ async def query_once(pool: asyncpg.Pool, query: str, *, top_k: int = TOP_K) -> N
 
 
 async def query() -> None:
-    async with await postgres.create_pool(DATABASE_URL) as pool:
+    embedder = SentenceTransformerEmbedder(EMBED_MODEL)
+    async with await asyncpg.create_pool(DATABASE_URL) as pool:
         if len(sys.argv) > 2:
             q = " ".join(sys.argv[2:])
-            await query_once(pool, q)
+            await query_once(pool, embedder, q)
             return
         print('Usage: python main.py query "your search query"')
 

@@ -22,12 +22,11 @@ import asyncpg
 from numpy.typing import NDArray
 
 import cocoindex as coco
-import cocoindex.asyncio as coco_aio
 from cocoindex.connectors import localfs, postgres
 from cocoindex.ops.text import RecursiveSplitter, detect_code_language
 from cocoindex.ops.sentence_transformers import SentenceTransformerEmbedder
 from cocoindex.resources.chunk import Chunk
-from cocoindex.resources.file import AsyncFileLike, PatternFilePathMatcher
+from cocoindex.resources.file import FileLike, PatternFilePathMatcher
 from cocoindex.resources.id import IdGenerator
 
 
@@ -39,9 +38,10 @@ PG_SCHEMA_NAME = "coco_examples"
 TOP_K = 5
 
 
-PG_DB = coco.ContextKey[postgres.PgDatabase]("pg_db")
+EMBED_MODEL = "sentence-transformers/all-MiniLM-L6-v2"
+PG_DB = coco.ContextKey[asyncpg.Pool]("code_embedding_db")
+EMBEDDER = coco.ContextKey[SentenceTransformerEmbedder]("embedder", detect_change=True)
 
-_embedder = SentenceTransformerEmbedder("sentence-transformers/all-MiniLM-L6-v2")
 _splitter = RecursiveSplitter()
 
 
@@ -50,29 +50,30 @@ class CodeEmbedding:
     id: int
     filename: str
     code: str
-    embedding: Annotated[NDArray, _embedder]
+    embedding: Annotated[NDArray, EMBEDDER]
     start_line: int
     end_line: int
 
 
-@coco_aio.lifespan
+@coco.lifespan
 async def coco_lifespan(
-    builder: coco_aio.EnvironmentBuilder,
+    builder: coco.EnvironmentBuilder,
 ) -> AsyncIterator[None]:
     # Provide resources needed across the CocoIndex environment
-    async with await postgres.create_pool(DATABASE_URL) as pool:
-        builder.provide(PG_DB, postgres.register_db("code_embedding_db", pool))
+    async with await asyncpg.create_pool(DATABASE_URL) as pool:
+        builder.provide(PG_DB, pool)
+        builder.provide(EMBEDDER, SentenceTransformerEmbedder(EMBED_MODEL))
         yield
 
 
-@coco.function
+@coco.fn
 async def process_chunk(
     chunk: Chunk,
     filename: pathlib.PurePath,
     id_gen: IdGenerator,
     table: postgres.TableTarget[CodeEmbedding],
 ) -> None:
-    embedding = await _embedder.embed(chunk.text)
+    embedding = await coco.use_context(EMBEDDER).embed(chunk.text)
     table.declare_row(
         row=CodeEmbedding(
             id=await id_gen.next_id(chunk.text),
@@ -85,9 +86,9 @@ async def process_chunk(
     )
 
 
-@coco.function(memo=True)
+@coco.fn(memo=True)
 async def process_file(
-    file: AsyncFileLike,
+    file: FileLike,
     table: postgres.TableTarget[CodeEmbedding],
 ) -> None:
     text = await file.read_text()
@@ -103,13 +104,13 @@ async def process_file(
         language=language,
     )
     id_gen = IdGenerator()
-    await coco_aio.map(process_chunk, chunks, file.file_path.path, id_gen, table)
+    await coco.map(process_chunk, chunks, file.file_path.path, id_gen, table)
 
 
-@coco.function
+@coco.fn
 async def app_main(sourcedir: pathlib.Path) -> None:
-    target_db = coco.use_context(PG_DB)
-    target_table = await target_db.mount_table_target(
+    target_table = await postgres.mount_table_target(
+        PG_DB,
         table_name=TABLE_NAME,
         table_schema=await postgres.TableSchema.from_class(
             CodeEmbedding,
@@ -117,6 +118,7 @@ async def app_main(sourcedir: pathlib.Path) -> None:
         ),
         pg_schema_name=PG_SCHEMA_NAME,
     )
+    target_table.declare_vector_index(column="embedding")
 
     # Process multiple file types across the repository
     files = localfs.walk_dir(
@@ -133,11 +135,11 @@ async def app_main(sourcedir: pathlib.Path) -> None:
             excluded_patterns=["**/.*", "**/target", "**/node_modules"],
         ),
     )
-    await coco_aio.mount_each(process_file, files.items(), target_table)
+    await coco.mount_each(process_file, files.items(), target_table)
 
 
-app = coco_aio.App(
-    coco_aio.AppConfig(name="CodeEmbeddingV1"),
+app = coco.App(
+    coco.AppConfig(name="CodeEmbeddingV1"),
     app_main,
     sourcedir=pathlib.Path(__file__).parent / ".." / "..",  # Index from repository root
 )
@@ -148,8 +150,14 @@ app = coco_aio.App(
 # ============================================================================
 
 
-async def query_once(pool: asyncpg.Pool, query: str, *, top_k: int = TOP_K) -> None:
-    query_vec = await _embedder.embed(query)
+async def query_once(
+    pool: asyncpg.Pool,
+    embedder: SentenceTransformerEmbedder,
+    query: str,
+    *,
+    top_k: int = TOP_K,
+) -> None:
+    query_vec = await embedder.embed(query)
     async with pool.acquire() as conn:
         rows = await conn.fetch(
             f"""
@@ -175,22 +183,23 @@ async def query_once(pool: asyncpg.Pool, query: str, *, top_k: int = TOP_K) -> N
 
 
 async def query() -> None:
-    async with await postgres.create_pool(DATABASE_URL) as pool:
+    embedder = SentenceTransformerEmbedder(EMBED_MODEL)
+    async with await asyncpg.create_pool(DATABASE_URL) as pool:
         if len(sys.argv) > 2:
             q = " ".join(sys.argv[2:])
-            await query_once(pool, q)
+            await query_once(pool, embedder, q)
             return
 
         while True:
             q = input("Enter search query (or Enter to quit): ").strip()
             if not q:
                 break
-            await query_once(pool, q)
+            await query_once(pool, embedder, q)
 
 
 async def update_index() -> None:
-    async with coco_aio.runtime():
-        await app.update(report_to_stdout=True)
+    async with coco.runtime():
+        await coco.show_progress(app.update())
 
 
 if __name__ == "__main__":

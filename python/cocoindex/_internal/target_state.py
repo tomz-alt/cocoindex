@@ -3,7 +3,7 @@ from __future__ import annotations
 from typing import (
     Collection,
     Generic,
-    Hashable,
+    Literal,
     NamedTuple,
     Protocol,
     Any,
@@ -17,7 +17,14 @@ from typing_extensions import TypeVar
 
 from . import core
 from .component_ctx import get_context_from_ctx
+from .context_keys import ContextProvider
 from .pending_marker import PendingS, MaybePendingS, ResolvesTo
+from .serde import (
+    make_deserialize_fn,
+    get_param_annotation,
+    qualified_name,
+    unwrap_element_type,
+)
 from .typing import NonExistenceType, StableKey
 
 
@@ -46,6 +53,45 @@ OptChildHandlerT_co = TypeVar(
 )
 
 
+class _TypedTargetHandlerWrapper:
+    """Wraps a TargetHandler to auto-deserialize tracking records (StoredValue → typed objects)."""
+
+    __slots__ = ("_handler", "_deserializer")
+
+    def __init__(self, handler: Any) -> None:
+        self._handler = handler
+        # reconcile(self, key, desired, prev_possible_records, ...) — position 3
+        reconcile_label = qualified_name(type(handler).reconcile)
+        try:
+            ann = get_param_annotation(type(handler).reconcile, 3)
+            record_type = unwrap_element_type(ann)
+        except Exception:
+            record_type = Any
+        self._deserializer = make_deserialize_fn(
+            record_type,
+            source_label=f"prev_possible_records param of {reconcile_label}()",
+        )
+
+    def reconcile(
+        self,
+        key: Any,
+        desired: Any,
+        prev_possible_records: Any,
+        prev_may_be_missing: bool,
+        /,
+    ) -> Any:
+        records = [r.get(self._deserializer) for r in prev_possible_records]
+        return self._handler.reconcile(key, desired, records, prev_may_be_missing)
+
+    def attachments(self) -> dict[str, Any]:
+        if not hasattr(self._handler, "attachments"):
+            return {}
+        return {
+            k: _TypedTargetHandlerWrapper(v)
+            for k, v in self._handler.attachments().items()
+        }
+
+
 class ChildTargetDef(Generic[HandlerT_co], NamedTuple):
     handler: HandlerT_co
 
@@ -55,6 +101,7 @@ class TargetActionSinkFn(Protocol[ActionT_contra, OptChildHandlerT_co]):
     @overload
     def __call__(
         self: TargetActionSinkFn[ActionT_contra, None],
+        context_provider: ContextProvider,
         actions: Sequence[ActionT_contra],
         /,
     ) -> None: ...
@@ -62,11 +109,12 @@ class TargetActionSinkFn(Protocol[ActionT_contra, OptChildHandlerT_co]):
     @overload
     def __call__(
         self: TargetActionSinkFn[ActionT_contra, HandlerT_co],
+        context_provider: ContextProvider,
         actions: Sequence[ActionT_contra],
         /,
     ) -> Sequence[ChildTargetDef[HandlerT_co] | None] | None: ...
     def __call__(
-        self, actions: Sequence[ActionT_contra], /
+        self, context_provider: ContextProvider, actions: Sequence[ActionT_contra], /
     ) -> Sequence[ChildTargetDef[Any] | None] | None: ...
 
 
@@ -75,6 +123,7 @@ class AsyncTargetActionSinkFn(Protocol[ActionT_contra, OptChildHandlerT_co]):
     @overload
     async def __call__(
         self: AsyncTargetActionSinkFn[ActionT_contra, None],
+        context_provider: ContextProvider,
         actions: Sequence[ActionT_contra],
         /,
     ) -> None: ...
@@ -82,11 +131,12 @@ class AsyncTargetActionSinkFn(Protocol[ActionT_contra, OptChildHandlerT_co]):
     @overload
     async def __call__(
         self: AsyncTargetActionSinkFn[ActionT_contra, HandlerT_co],
+        context_provider: ContextProvider,
         actions: Sequence[ActionT_contra],
         /,
     ) -> Sequence[ChildTargetDef[HandlerT_co] | None] | None: ...
     async def __call__(
-        self, actions: Sequence[ActionT_contra], /
+        self, context_provider: ContextProvider, actions: Sequence[ActionT_contra], /
     ) -> Sequence[ChildTargetDef[Any] | None] | None: ...
 
 
@@ -141,6 +191,7 @@ class TargetReconcileOutput(
     action: ActionT
     sink: TargetActionSink[ActionT, OptChildHandlerT_co]
     tracking_record: TrackingRecordT_co | NonExistenceType
+    child_invalidation: Literal["destructive", "lossy"] | None = None
 
 
 class TargetHandler(Protocol[ValueT_contra, TrackingRecordT, OptChildHandlerT_co]):
@@ -148,7 +199,7 @@ class TargetHandler(Protocol[ValueT_contra, TrackingRecordT, OptChildHandlerT_co
         self,
         key: StableKey,
         desired_target_state: ValueT_contra | NonExistenceType,
-        prev_possible_states: Collection[TrackingRecordT],
+        prev_possible_records: Collection[TrackingRecordT],
         prev_may_be_missing: bool,
         /,
     ) -> TargetReconcileOutput[Any, TrackingRecordT, OptChildHandlerT_co] | None: ...
@@ -158,13 +209,15 @@ class TargetStateProvider(
     Generic[ValueT, OptChildHandlerT, MaybePendingS],
     ResolvesTo["TargetStateProvider[ValueT, OptChildHandlerT]"],
 ):
-    __slots__ = ("_core", "memo_key")
+    __slots__ = ("_core",)
     _core: core.TargetStateProvider
-    memo_key: str
 
     def __init__(self, core_provider: core.TargetStateProvider):
         self._core = core_provider
-        self.memo_key = core_provider.coco_memo_key()
+
+    @property
+    def memo_key(self) -> str:
+        return self._core.coco_memo_key()
 
     def target_state(
         self: TargetStateProvider[ValueT, OptChildHandlerT],
@@ -173,8 +226,18 @@ class TargetStateProvider(
     ) -> "TargetState[OptChildHandlerT]":
         return TargetState(self, key, value)
 
+    def attachment(
+        self: TargetStateProvider[ValueT, OptChildHandlerT],
+        att_type: str,
+    ) -> "TargetStateProvider":
+        ctx = get_context_from_ctx()
+        provider = self._core.register_attachment_provider(
+            ctx._core_processor_ctx, att_type
+        )
+        return TargetStateProvider(provider)
+
     def __coco_memo_key__(self) -> str:
-        return self.memo_key
+        return self._core.coco_memo_key()
 
 
 PendingTargetStateProvider: TypeAlias = TargetStateProvider[
@@ -242,5 +305,6 @@ def declare_target_state_with_child(
 def register_root_target_states_provider(
     name: str, handler: TargetHandler[ValueT, Any, OptChildHandlerT]
 ) -> TargetStateProvider[ValueT, OptChildHandlerT]:
-    provider = core.register_root_target_states_provider(name, handler)
+    wrapped = _TypedTargetHandlerWrapper(handler)
+    provider = core.register_root_target_states_provider(name, wrapped)
     return TargetStateProvider(provider)
